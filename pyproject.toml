@@ -1,0 +1,30 @@
+[project]
+name = "yolo26-small-object-lab"
+version = "0.1.0"
+description = "Measure the smallest objects YOLO26 can detect from an Android camera over Tailscale."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "ultralytics>=8.4.0",
+]
+
+[project.scripts]
+yolo26-small-object-lab = "small_object_lab.launcher:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pyflakes",
+    "pytest",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["small_object_lab"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
