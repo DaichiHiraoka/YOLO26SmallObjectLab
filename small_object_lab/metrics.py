@@ -13,6 +13,7 @@ class Detection:
     width: int
     height: int
     streak: int = 1
+    enhanced: bool = False
 
     @property
     def area_px(self) -> int:
@@ -32,6 +33,7 @@ class Detection:
             "height_pct": round(100.0 * self.height / max(1, frame_height), 4),
             "area_pct": round(100.0 * self.area_px / frame_area, 6),
             "streak": self.streak,
+            "source": "super_resolution" if self.enhanced else "full_frame",
         }
 
 

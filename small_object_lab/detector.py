@@ -11,7 +11,15 @@ from typing import Any
 import cv2
 import numpy as np
 
-from .metrics import Detection, StabilityTracker, smallest
+from .metrics import Detection, StabilityTracker, intersection_over_union, smallest
+from .super_resolution import (
+    CropRegion,
+    FSRCNNSuperResolution,
+    LargestObjectInstabilityMonitor,
+    SuperResolutionDecision,
+    expanded_crop_region,
+    remap_from_super_resolution,
+)
 
 
 @dataclass
@@ -20,6 +28,9 @@ class LabSettings:
     imgsz: int = 960
     target_classes: str = ""
     stable_frames: int = 3
+    super_resolution_enabled: bool = True
+    sr_trigger_confidence: float = 0.45
+    sr_trigger_area_pct: float = 1.0
 
     def class_filter(self) -> set[str]:
         return {
@@ -78,6 +89,8 @@ class SmallObjectLab:
         self.measurements_lock = threading.Lock()
         self.settings = LabSettings()
         self.stability = StabilityTracker()
+        self.super_resolution = FSRCNNSuperResolution()
+        self.instability_monitor = LargestObjectInstabilityMonitor()
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
         self.source_worker: threading.Thread | None = None
@@ -100,6 +113,14 @@ class SmallObjectLab:
         self.next_auto_save_at: float | None = None
         self.auto_save_count = 0
         self.last_auto_save_path = ""
+        self.super_resolution_active = False
+        self.super_resolution_reason = ""
+        self.super_resolution_attempts = 0
+        self.super_resolution_adoptions = 0
+        self.super_resolution_ms = 0.0
+        self.super_resolution_region: CropRegion | None = None
+        self.super_resolution_target: Detection | None = None
+        self.super_resolution_error = ""
 
         self._write_csv_headers()
 
@@ -110,6 +131,7 @@ class SmallObjectLab:
                     "timestamp",
                     "frame",
                     "label",
+                    "detection_source",
                     "confidence",
                     "x",
                     "y",
@@ -139,6 +161,7 @@ class SmallObjectLab:
                     "physical_width_mm",
                     "camera_distance_cm",
                     "label",
+                    "detection_source",
                     "confidence",
                     "x",
                     "y",
@@ -200,17 +223,42 @@ class SmallObjectLab:
             target_classes = str(
                 values.get("target_classes", self.settings.target_classes)
             )
+            super_resolution_enabled = bool(
+                values.get(
+                    "super_resolution_enabled",
+                    self.settings.super_resolution_enabled,
+                )
+            )
+            sr_trigger_confidence = float(
+                values.get(
+                    "sr_trigger_confidence",
+                    self.settings.sr_trigger_confidence,
+                )
+            )
+            sr_trigger_area_pct = float(
+                values.get(
+                    "sr_trigger_area_pct",
+                    self.settings.sr_trigger_area_pct,
+                )
+            )
             if not 0.01 <= confidence <= 0.99:
                 raise ValueError("confidenceは0.01〜0.99で指定してください")
             if imgsz not in {320, 480, 640, 960, 1280, 1536}:
                 raise ValueError("imgszは320, 480, 640, 960, 1280, 1536から選択してください")
             if not 1 <= stable_frames <= 30:
                 raise ValueError("stable_framesは1〜30で指定してください")
+            if not 0.01 <= sr_trigger_confidence <= 0.99:
+                raise ValueError("超解像confidenceは0.01〜0.99で指定してください")
+            if not 0.01 <= sr_trigger_area_pct <= 100.0:
+                raise ValueError("超解像bbox面積は0.01〜100%で指定してください")
             self.settings = LabSettings(
                 confidence=confidence,
                 imgsz=imgsz,
                 target_classes=target_classes,
                 stable_frames=stable_frames,
+                super_resolution_enabled=super_resolution_enabled,
+                sr_trigger_confidence=sr_trigger_confidence,
+                sr_trigger_area_pct=sr_trigger_area_pct,
             )
             return self.settings
 
@@ -219,6 +267,7 @@ class SmallObjectLab:
             self.smallest_confirmed = None
             self.smallest_current = None
             self.stability.reset()
+            self.instability_monitor.reset()
 
     def record_measurement(self, values: dict[str, object]) -> Path:
         with self.lock:
@@ -239,6 +288,7 @@ class SmallObjectLab:
                 str(values.get("physical_width_mm", "")).strip(),
                 str(values.get("camera_distance_cm", "")).strip(),
                 detection.label,
+                "super_resolution" if detection.enhanced else "full_frame",
                 detection.confidence,
                 detection.x,
                 detection.y,
@@ -301,6 +351,25 @@ class SmallObjectLab:
                     else self.auto_save_interval_sec
                 ),
                 "last_auto_save_path": self.last_auto_save_path,
+                "super_resolution": {
+                    "enabled": self.settings.super_resolution_enabled,
+                    "model": "FSRCNN x2",
+                    "target_strategy": "largest_bbox",
+                    "ready": self.super_resolution.ready,
+                    "active": self.super_resolution_active,
+                    "reason": self.super_resolution_reason,
+                    "attempts": self.super_resolution_attempts,
+                    "adoptions": self.super_resolution_adoptions,
+                    "inference_ms": round(self.super_resolution_ms, 1),
+                    "error": self.super_resolution_error,
+                    "target": (
+                        self.super_resolution_target.as_dict(
+                            self.frame_width, self.frame_height
+                        )
+                        if self.super_resolution_target
+                        else None
+                    ),
+                },
                 "settings": vars(self.settings),
                 "detections": [
                     item.as_dict(self.frame_width, self.frame_height)
@@ -397,19 +466,76 @@ class SmallObjectLab:
             device=self._resolved_device(),
             verbose=False,
         )
-        elapsed = time.perf_counter() - started
         height, width = frame.shape[:2]
         detections = self._extract_detections(results, settings)
+        decision = self.instability_monitor.decide(
+            detections,
+            frame_width=width,
+            frame_height=height,
+            trigger_confidence=settings.sr_trigger_confidence,
+            trigger_area_pct=settings.sr_trigger_area_pct,
+        )
+        sr_region: CropRegion | None = None
+        sr_attempted = False
+        sr_used = False
+        sr_elapsed = 0.0
+        sr_error = ""
+        sr_target = decision.target
+        if settings.super_resolution_enabled and decision.should_apply:
+            sr_attempted = True
+            sr_started = time.perf_counter()
+            try:
+                enhanced_detection, sr_region = self._infer_super_resolution(
+                    frame,
+                    decision,
+                    settings,
+                )
+                detections, sr_used = self._merge_super_resolution_detection(
+                    detections,
+                    decision.target,
+                    enhanced_detection,
+                )
+                if sr_used:
+                    sr_target = enhanced_detection
+            except Exception as error:
+                sr_error = str(error)
+            sr_elapsed = time.perf_counter() - sr_started
+
         detections = self.stability.update(detections)
+        elapsed = time.perf_counter() - started
         current_smallest = smallest(detections)
         confirmed = [
             item for item in detections if item.streak >= settings.stable_frames
         ]
 
         annotated = frame.copy()
+        if sr_region is not None:
+            cv2.rectangle(
+                annotated,
+                (sr_region.x, sr_region.y),
+                (
+                    sr_region.x + sr_region.width,
+                    sr_region.y + sr_region.height,
+                ),
+                (255, 130, 20),
+                2,
+            )
+            cv2.putText(
+                annotated,
+                f"FSRCNN x2: {decision.reason}",
+                (sr_region.x, max(20, sr_region.y - 7)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 130, 20),
+                2,
+                cv2.LINE_AA,
+            )
         for detection in detections:
             is_confirmed = detection.streak >= settings.stable_frames
-            color = (54, 211, 153) if is_confirmed else (0, 190, 255)
+            if detection.enhanced:
+                color = (255, 80, 220)
+            else:
+                color = (54, 211, 153) if is_confirmed else (0, 190, 255)
             cv2.rectangle(
                 annotated,
                 (detection.x, detection.y),
@@ -424,6 +550,7 @@ class SmallObjectLab:
                 f"{detection.label} {detection.confidence:.2f} "
                 f"{detection.width}x{detection.height}px "
                 f"[{detection.streak}/{settings.stable_frames}]"
+                f"{' SR' if detection.enhanced else ''}"
             )
             cv2.putText(
                 annotated,
@@ -458,7 +585,17 @@ class SmallObjectLab:
                 ):
                     self.smallest_confirmed = item
             self.latest_jpeg = jpeg.tobytes()
-            self.status_message = "推論中"
+            self.super_resolution_active = sr_attempted
+            self.super_resolution_reason = decision.reason if sr_attempted else ""
+            self.super_resolution_ms = sr_elapsed * 1000.0
+            self.super_resolution_region = sr_region
+            self.super_resolution_target = sr_target if sr_attempted else None
+            self.super_resolution_error = sr_error
+            if sr_attempted:
+                self.super_resolution_attempts += 1
+            if sr_used:
+                self.super_resolution_adoptions += 1
+            self.status_message = "局所超解像中" if sr_attempted else "推論中"
             self.error_message = ""
 
         self._append_detections(
@@ -476,6 +613,75 @@ class SmallObjectLab:
             settings=settings,
             jpeg_payload=jpeg.tobytes(),
         )
+
+    def _infer_super_resolution(
+        self,
+        frame: np.ndarray,
+        decision: SuperResolutionDecision,
+        settings: LabSettings,
+    ) -> tuple[Detection | None, CropRegion]:
+        target = decision.target
+        if target is None:
+            raise ValueError("超解像の対象がありません")
+        height, width = frame.shape[:2]
+        region = expanded_crop_region(target, width, height)
+        crop = frame[
+            region.y : region.y + region.height,
+            region.x : region.x + region.width,
+        ]
+        enhanced_crop = self.super_resolution.enhance(crop)
+        results = self.model.predict(
+            enhanced_crop,
+            conf=max(0.05, settings.confidence * 0.6),
+            imgsz=max(320, min(settings.imgsz, 640)),
+            device=self._resolved_device(),
+            verbose=False,
+        )
+        local_detections = [
+            item
+            for item in self._extract_detections(results, settings)
+            if item.label.casefold() == target.label.casefold()
+        ]
+        if not local_detections:
+            return None, region
+        mapped_detections = [
+            remap_from_super_resolution(
+                candidate,
+                region,
+                scale=self.super_resolution.scale,
+                frame_width=width,
+                frame_height=height,
+            )
+            for candidate in local_detections
+        ]
+        candidate = max(
+            mapped_detections,
+            key=lambda item: (
+                intersection_over_union(target, item),
+                item.confidence,
+            ),
+        )
+        if intersection_over_union(target, candidate) < 0.05:
+            return None, region
+        return candidate, region
+
+    @staticmethod
+    def _merge_super_resolution_detection(
+        detections: list[Detection],
+        target: Detection | None,
+        enhanced: Detection | None,
+    ) -> tuple[list[Detection], bool]:
+        if target is None or enhanced is None:
+            return detections, False
+        for index, item in enumerate(detections):
+            if item is not target:
+                continue
+            if enhanced.confidence < item.confidence:
+                return detections, False
+            merged = list(detections)
+            merged[index] = enhanced
+            return merged, True
+        return [*detections, enhanced], True
 
     def _maybe_auto_save(
         self,
@@ -520,6 +726,7 @@ class SmallObjectLab:
             data = selected.as_dict(width, height)
             detection_values: list[object] = [
                 selected.label,
+                "super_resolution" if selected.enhanced else "full_frame",
                 selected.confidence,
                 selected.x,
                 selected.y,
@@ -530,7 +737,7 @@ class SmallObjectLab:
                 selected.streak,
             ]
         else:
-            detection_values = ["", "", "", "", "", "", "", "", 0]
+            detection_values = ["", "", "", "", "", "", "", "", "", 0]
 
         row = [
             timestamp.isoformat(timespec="milliseconds"),
@@ -609,6 +816,7 @@ class SmallObjectLab:
                     timestamp,
                     frame_number,
                     detection.label,
+                    "super_resolution" if detection.enhanced else "full_frame",
                     detection.confidence,
                     detection.x,
                     detection.y,

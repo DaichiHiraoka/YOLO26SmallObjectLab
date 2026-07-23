@@ -69,6 +69,21 @@ outputs/yolo26_small_object_lab/<開始日時>/
 
 対象物から離れてPCへ手が届かなくても記録は継続します。検出できなかった時点も保存されるため、後から検出限界を確認できます。
 
+## 不安定時の局所超解像
+
+通常は720×720の全フレームをそのままYOLO26へ渡します。次の兆候が出た場合だけ、検出中でbbox面積が最大の物体を選び、その周囲をFSRCNNで2倍に超解像して局所再推論します。
+
+- confidenceが既定`0.45`以下
+- bbox面積が画面の既定`1.0%`以下
+- 前フレームからconfidenceまたはbbox面積が急低下
+- 検出が消えてから2フレーム以内
+
+青枠は超解像した領域、マゼンタのbboxと`SR`表示は局所再推論結果が通常結果より有効で採用されたことを示します。画面から超解像の有効・無効と2つのしきい値を変更できます。`detections.csv`と`measurements.csv`の`detection_source`列には`full_frame`または`super_resolution`を記録します。
+
+対象選択は[small_object_lab/super_resolution.py](./small_object_lab/super_resolution.py)の`select_super_resolution_target()`へ分離してあります。現在は最大bboxですが、後から別の選択方法へ差し替えられます。
+
+FSRCNN x2モデル（約40KB）は初回使用時に自動取得し、`models/FSRCNN_x2.pb`へキャッシュします。取得後はSHA-256を検証します。モデルはOpenCVのGSoC成果として公開されている[Saafke/FSRCNN_Tensorflow](https://github.com/Saafke/FSRCNN_Tensorflow)（Apache-2.0）を使用します。
+
 ## 比較設定
 
 既定値:
@@ -77,6 +92,7 @@ outputs/yolo26_small_object_lab/<開始日時>/
 - `imgsz`: `960`
 - confidence: `0.20`
 - 安定検出: `3`フレーム
+- 局所超解像: `FSRCNN x2`
 
 画面から `imgsz`、confidence、対象COCOクラスを変更できます。鍵やUSBメモリなどCOCOに存在しない物体は、単に小さいのではなく未学習のため検出できない場合があります。
 

@@ -44,6 +44,8 @@ button, a.button { cursor: pointer; text-align: center; background: #163047; fon
 button.primary { background: var(--accent); color: #052017; border-color: var(--accent); }
 button:hover, a.button:hover { filter: brightness(1.15); }
 .row { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.check { display: flex; align-items: center; gap: 9px; }
+.check input { width: auto; }
 .actions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
 .small { font-size: .78rem; color: var(--muted); overflow-wrap: anywhere; }
 .error { color: var(--danger); min-height: 1.2em; }
@@ -101,7 +103,16 @@ DASHBOARD_HTML = f"""<!doctype html>
         </div>
         <label>対象クラス（英語、カンマ区切り。空欄は全クラス）</label>
         <input id="classes" placeholder="cell phone, bottle, cup">
+        <label class="check"><input id="srEnabled" type="checkbox" checked>
+          不安定兆候時に最大bboxを局所超解像</label>
+        <div class="row">
+          <div><label>超解像を始めるconfidence以下</label>
+            <input id="srConfidence" type="number" min=".01" max=".99" step=".01" value=".45"></div>
+          <div><label>超解像を始めるbbox面積%以下</label>
+            <input id="srArea" type="number" min=".01" max="100" step=".01" value="1.00"></div>
+        </div>
         <button class="primary" style="margin-top:12px" onclick="saveSettings()">設定を反映</button>
+        <p id="srState" class="small"></p>
         <div id="error" class="error small"></div>
       </section>
       <section class="panel">
@@ -140,15 +151,22 @@ async function poll() {{
     document.querySelector("#output").textContent = `保存先: ${{s.output_dir}}`;
     document.querySelector("#autosave").textContent =
       `${{s.auto_save_interval_sec}}秒ごとに自動保存 / 次回 ${{s.auto_save_in_sec}}秒後 / 保存 ${{s.auto_save_count}}件`;
-    document.querySelector("#error").textContent = s.error || "";
+    const sr = s.super_resolution;
+    document.querySelector("#srState").textContent = sr.active
+      ? `FSRCNN x2実行中 (${{sr.reason}}) / ${{sr.inference_ms}} ms / 採用 ${{sr.adoptions}}/${{sr.attempts}}`
+      : `局所超解像待機 / 対象: 最大bbox / 採用 ${{sr.adoptions}}/${{sr.attempts}}`;
+    document.querySelector("#error").textContent = s.error || sr.error || "";
     document.querySelector("#detections").innerHTML = s.detections.length ? s.detections.map(d =>
-      `<tr><td>${{d.label}}</td><td>${{d.confidence}}</td><td>${{d.width_px}}×${{d.height_px}}</td><td>${{d.area_pct}}</td><td>${{d.streak}}/${{s.settings.stable_frames}}</td></tr>`
+      `<tr><td>${{d.label}}${{d.source === "super_resolution" ? " (SR)" : ""}}</td><td>${{d.confidence}}</td><td>${{d.width_px}}×${{d.height_px}}</td><td>${{d.area_pct}}</td><td>${{d.streak}}/${{s.settings.stable_frames}}</td></tr>`
     ).join("") : '<tr><td colspan="5">検出なし</td></tr>';
     if (!initialized) {{
       document.querySelector("#imgsz").value = s.settings.imgsz;
       document.querySelector("#confidence").value = s.settings.confidence;
       document.querySelector("#stable").value = s.settings.stable_frames;
       document.querySelector("#classes").value = s.settings.target_classes;
+      document.querySelector("#srEnabled").checked = s.settings.super_resolution_enabled;
+      document.querySelector("#srConfidence").value = s.settings.sr_trigger_confidence;
+      document.querySelector("#srArea").value = s.settings.sr_trigger_area_pct;
       initialized = true;
     }}
   }} catch (e) {{ document.querySelector("#error").textContent = "状態取得失敗: " + e; }}
@@ -165,7 +183,10 @@ async function saveSettings() {{
       imgsz:+document.querySelector("#imgsz").value,
       confidence:+document.querySelector("#confidence").value,
       stable_frames:+document.querySelector("#stable").value,
-      target_classes:document.querySelector("#classes").value
+      target_classes:document.querySelector("#classes").value,
+      super_resolution_enabled:document.querySelector("#srEnabled").checked,
+      sr_trigger_confidence:+document.querySelector("#srConfidence").value,
+      sr_trigger_area_pct:+document.querySelector("#srArea").value
     }}); document.querySelector("#error").textContent = "";
   }} catch(e) {{ document.querySelector("#error").textContent = e; }}
 }}

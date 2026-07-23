@@ -45,6 +45,9 @@ def test_server_exposes_dashboard_and_updates_settings(tmp_path):
                 "imgsz": 1280,
                 "stable_frames": 5,
                 "target_classes": "cell phone",
+                "super_resolution_enabled": True,
+                "sr_trigger_confidence": 0.4,
+                "sr_trigger_area_pct": 0.75,
             },
         )
         assert status == 200
@@ -54,6 +57,9 @@ def test_server_exposes_dashboard_and_updates_settings(tmp_path):
             "imgsz": 1280,
             "target_classes": "cell phone",
             "stable_frames": 5,
+            "super_resolution_enabled": True,
+            "sr_trigger_confidence": 0.4,
+            "sr_trigger_area_pct": 0.75,
         }
     finally:
         server.shutdown()
