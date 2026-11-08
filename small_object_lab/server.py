@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .detector import SmallObjectLab
-from .web import DASHBOARD_HTML
+from .web import DASHBOARD_HTML, REMOTE_HTML
 
 
 class LabHTTPServer(ThreadingHTTPServer):
@@ -30,12 +30,18 @@ class LabRequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/":
             self._html(DASHBOARD_HTML)
+        elif path == "/remote":
+            self._html(REMOTE_HTML)
         elif path == "/api/status":
             self._json(HTTPStatus.OK, self.server.lab.status())
         elif path == "/api/stream":
             self._mjpeg_stream()
         elif path == "/api/detections.csv":
             self._file(self.server.lab.csv_path, "text/csv; charset=utf-8")
+        elif path == "/api/frames.csv":
+            self._file(
+                self.server.lab.frames_path, "text/csv; charset=utf-8"
+            )
         elif path == "/api/measurements.csv":
             self._file(
                 self.server.lab.measurements_path, "text/csv; charset=utf-8"
@@ -47,9 +53,24 @@ class LabRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        content_type = self.headers.get("Content-Type", "")
+        if content_type.split(";")[0].strip().casefold() != "application/json":
+            # Browsers must send a CORS preflight for this type, so other
+            # websites cannot start or stop recordings through a plain form.
+            self._json(
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                {"error": "Content-Type: application/json が必要です"},
+            )
+            return
         try:
             values = self._read_json()
-            if path == "/api/settings":
+            if path == "/api/recording/start":
+                recording = self.server.lab.start_recording()
+                self._json(HTTPStatus.OK, {"ok": True, "recording": recording})
+            elif path == "/api/recording/stop":
+                recording = self.server.lab.stop_recording()
+                self._json(HTTPStatus.OK, {"ok": True, "recording": recording})
+            elif path == "/api/settings":
                 settings = self.server.lab.update_settings(values)
                 self._json(HTTPStatus.OK, {"ok": True, "settings": vars(settings)})
             elif path == "/api/reset":
@@ -167,6 +188,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("outputs/yolo26_small_object_lab"),
     )
     parser.add_argument("--open-browser", action="store_true")
+    parser.add_argument(
+        "--remote-host",
+        help="スマホ操作用に追加で待ち受けるPCのTailscale IP。例: 100.x.y.z",
+    )
     return parser
 
 
@@ -179,6 +204,7 @@ def run_server(
     device: str = "auto",
     output_dir: Path = Path("outputs/yolo26_small_object_lab"),
     open_browser: bool = False,
+    remote_host: str | None = None,
 ) -> int:
     lab = SmallObjectLab(
         model_name=model,
@@ -187,6 +213,20 @@ def run_server(
         output_root=output_dir,
     )
     server = LabHTTPServer((host, port), lab)
+    servers = [server]
+    if remote_host:
+        # Listen on the Tailscale address only, never on every LAN interface.
+        try:
+            servers.append(LabHTTPServer((remote_host, port), lab))
+            lab.remote_url = f"http://{remote_host}:{port}/remote"
+        except OSError as error:
+            print(f"スマホ操作用の待受を開始できません ({remote_host}:{port}): {error}")
+    for extra in servers[1:]:
+        threading.Thread(
+            target=extra.serve_forever,
+            kwargs={"poll_interval": 0.25},
+            daemon=True,
+        ).start()
     lab.start()
 
     stopping = threading.Event()
@@ -195,7 +235,8 @@ def run_server(
         if stopping.is_set():
             return
         stopping.set()
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        for item in servers:
+            threading.Thread(target=item.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGINT, stop_server)
     if hasattr(signal, "SIGTERM"):
@@ -203,6 +244,8 @@ def run_server(
 
     local_url = f"http://{host}:{port}"
     print(f"YOLO26 Small Object Lab: {local_url}")
+    if lab.remote_url:
+        print(f"スマホから記録開始・終了: {lab.remote_url}")
     print(f"Camera: {source}")
     print(f"Output: {lab.output_dir.resolve()}")
     if open_browser:
@@ -210,7 +253,9 @@ def run_server(
     try:
         server.serve_forever(poll_interval=0.25)
     finally:
-        server.server_close()
+        stop_server()
+        for item in servers:
+            item.server_close()
         lab.stop()
     return 0
 
@@ -225,6 +270,7 @@ def main() -> int:
         device=args.device,
         output_dir=args.output_dir,
         open_browser=args.open_browser,
+        remote_host=args.remote_host,
     )
 
 

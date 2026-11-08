@@ -14,6 +14,7 @@ class Detection:
     height: int
     streak: int = 1
     enhanced: bool = False
+    enhancement_scale: int = 1
 
     @property
     def area_px(self) -> int:
@@ -34,6 +35,7 @@ class Detection:
             "area_pct": round(100.0 * self.area_px / frame_area, 6),
             "streak": self.streak,
             "source": "super_resolution" if self.enhanced else "full_frame",
+            "sr_scale": self.enhancement_scale if self.enhanced else 1,
         }
 
 
@@ -45,6 +47,33 @@ def intersection_over_union(left: Detection, right: Detection) -> float:
     intersection = max(0, x2 - x1) * max(0, y2 - y1)
     union = left.area_px + right.area_px - intersection
     return intersection / union if union > 0 else 0.0
+
+
+ADOPT_MIN_IOU = 0.5
+ADOPT_MAX_AREA_RATIO = 4.0
+
+
+def plausible_replacement(candidate: Detection, reference: Detection, *, reference_observed: bool) -> bool:
+    """Whether a local re-detection may replace ``reference`` as the same object.
+
+    A zoomed crop can make the detector box only a part of the object (e.g. a
+    key fob instead of the key bunch) with high confidence. Adopting it shrinks
+    the tracked box until the full-frame detection no longer matches. With an
+    observed reference the boxes must overlap substantially; with only a
+    predicted position the size must stay comparable.
+    """
+    if reference_observed:
+        return intersection_over_union(candidate, reference) >= ADOPT_MIN_IOU
+    ratio = candidate.area_px / max(1, reference.area_px)
+    return 1 / ADOPT_MAX_AREA_RATIO <= ratio <= ADOPT_MAX_AREA_RATIO
+
+
+def coverage(inner: Detection, outer: Detection) -> float:
+    """Fraction of ``inner`` that lies inside ``outer``."""
+    x1, y1 = max(inner.x, outer.x), max(inner.y, outer.y)
+    x2 = min(inner.x + inner.width, outer.x + outer.width)
+    y2 = min(inner.y + inner.height, outer.y + outer.height)
+    return max(0, x2 - x1) * max(0, y2 - y1) / max(1, inner.area_px)
 
 
 class StabilityTracker:
@@ -85,3 +114,7 @@ class StabilityTracker:
 
 def smallest(detections: Iterable[Detection]) -> Detection | None:
     return min(detections, key=lambda item: item.area_px, default=None)
+
+
+def largest(detections: Iterable[Detection]) -> Detection | None:
+    return max(detections, key=lambda item: item.area_px, default=None)

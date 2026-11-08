@@ -1,3 +1,5 @@
+import csv
+
 import numpy as np
 
 from small_object_lab.detector import SmallObjectLab
@@ -5,6 +7,7 @@ from small_object_lab.metrics import Detection
 from small_object_lab.super_resolution import (
     FSRCNNSuperResolution,
     LargestObjectInstabilityMonitor,
+    dynamic_super_resolution_scales,
     expanded_crop_region,
     remap_from_super_resolution,
     select_super_resolution_target,
@@ -106,7 +109,44 @@ def test_crop_is_clamped_and_super_resolution_box_is_remapped():
     assert mapped.enhanced
 
 
-def test_fsrcnn_enhancer_is_lazy_and_returns_x2_image():
+def test_default_crop_stays_local_around_bbox():
+    target = detection(x=220, y=180, width=200, height=250)
+
+    region = expanded_crop_region(target, 720, 720)
+
+    assert region.x == 180
+    assert region.y == 130
+    assert region.width == 280
+    assert region.height == 350
+    assert region.width < 720
+    assert region.height < 720
+
+
+def test_dynamic_scale_increases_for_smaller_bboxes_and_respects_input_cap():
+    large = detection(width=80, height=100)
+    medium = detection(width=30, height=45)
+    tiny = detection(width=12, height=20)
+    elongated = detection(width=20, height=100)
+
+    assert dynamic_super_resolution_scales(
+        large,
+        expanded_crop_region(large, 720, 720),
+    ) == (2, 4)
+    assert dynamic_super_resolution_scales(
+        medium,
+        expanded_crop_region(medium, 720, 720),
+    ) == (4, 8)
+    assert dynamic_super_resolution_scales(
+        tiny,
+        expanded_crop_region(tiny, 720, 720),
+    ) == (8,)
+    assert dynamic_super_resolution_scales(
+        elongated,
+        expanded_crop_region(elongated, 720, 720),
+    ) == (4,)
+
+
+def test_fsrcnn_enhancer_cascades_x2_model_up_to_x8():
     class FakeUpsampler:
         def upsample(self, image):
             return np.repeat(np.repeat(image, 2, axis=0), 2, axis=1)
@@ -115,9 +155,9 @@ def test_fsrcnn_enhancer_is_lazy_and_returns_x2_image():
     engine._upsampler = FakeUpsampler()
     image = np.zeros((12, 20, 3), dtype=np.uint8)
 
-    result = engine.enhance(image)
-
-    assert result.shape == (24, 40, 3)
+    assert engine.enhance(image).shape == (24, 40, 3)
+    assert engine.enhance(image, scale=4).shape == (48, 80, 3)
+    assert engine.enhance(image, scale=8).shape == (96, 160, 3)
 
 
 def test_lab_adopts_higher_confidence_local_super_resolution_detection(tmp_path):
@@ -155,14 +195,18 @@ def test_lab_adopts_higher_confidence_local_super_resolution_detection(tmp_path)
             self.calls += 1
             if self.calls == 1:
                 return [Result([60, 60, 100, 110], 0.3)]
-            return [Result([160, 180, 240, 280], 0.8)]
+            return [Result([32, 40, 192, 240], 0.8)]
 
     class SuperResolution:
         scale = 2
         ready = True
 
-        def enhance(self, image):
-            return np.repeat(np.repeat(image, 2, axis=0), 2, axis=1)
+        def enhance(self, image, *, scale=2):
+            return np.repeat(
+                np.repeat(image, scale, axis=0),
+                scale,
+                axis=1,
+            )
 
     lab = SmallObjectLab(device="cpu", output_root=tmp_path)
     lab.model = Model()
@@ -174,6 +218,88 @@ def test_lab_adopts_higher_confidence_local_super_resolution_detection(tmp_path)
     assert lab.super_resolution_active
     assert lab.super_resolution_attempts == 1
     assert lab.super_resolution_adoptions == 1
+    assert lab.super_resolution_scale == 4
+    assert lab.super_resolution_scales_tried == (4,)
     assert len(lab.latest_detections) == 1
     assert lab.latest_detections[0].enhanced
+    assert lab.latest_detections[0].enhancement_scale == 4
     assert lab.latest_detections[0].confidence == 0.8
+
+    with lab.frames_path.open(encoding="utf-8-sig", newline="") as stream:
+        frame_rows = list(csv.DictReader(stream))
+    assert len(frame_rows) == 1
+    assert frame_rows[0]["sr_attempted"] == "1"
+    assert frame_rows[0]["sr_adopted"] == "1"
+    assert frame_rows[0]["sr_scale"] == "4"
+    assert frame_rows[0]["sr_scales_tried"] == "4"
+
+
+def test_lab_escalates_scale_when_first_sr_attempt_finds_nothing(tmp_path):
+    class TensorLike:
+        def __init__(self, values):
+            self.values = np.asarray(values)
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.values
+
+    class Boxes:
+        def __init__(self, box, confidence):
+            self.xyxy = TensorLike([box])
+            self.conf = TensorLike([confidence])
+            self.cls = TensorLike([0])
+
+        def __len__(self):
+            return 1
+
+    class EmptyBoxes:
+        def __len__(self):
+            return 0
+
+    class Result:
+        names = {0: "cup"}
+
+        def __init__(self, box=None, confidence=0.0):
+            self.boxes = (
+                EmptyBoxes()
+                if box is None
+                else Boxes(box, confidence)
+            )
+
+    class Model:
+        names = {0: "cup"}
+
+        def __init__(self):
+            self.calls = 0
+
+        def predict(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return [Result([60, 60, 140, 160], 0.3)]
+            if self.calls == 2:
+                return [Result()]
+            return [Result([64, 80, 384, 480], 0.8)]
+
+    class SuperResolution:
+        ready = True
+
+        def enhance(self, image, *, scale=2):
+            return np.repeat(
+                np.repeat(image, scale, axis=0),
+                scale,
+                axis=1,
+            )
+
+    lab = SmallObjectLab(device="cpu", output_root=tmp_path)
+    lab.model = Model()
+    lab.super_resolution = SuperResolution()
+
+    lab._infer(np.zeros((300, 300, 3), dtype=np.uint8))
+
+    assert lab.model.calls == 3
+    assert lab.super_resolution_scales_tried == (2, 4)
+    assert lab.super_resolution_scale == 4
+    assert lab.super_resolution_adoptions == 1
+    assert lab.latest_detections[0].enhancement_scale == 4

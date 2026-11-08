@@ -52,3 +52,6 @@ legacy/archive_20260616_previous_direction/data/**/*.mkv
 
 .idea/
 .vscode/
+
+# Downloaded public datasets (LVIS key subset etc.)
+datasets/

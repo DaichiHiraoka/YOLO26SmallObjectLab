@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import urllib.request
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -9,7 +10,7 @@ from typing import Any, Iterable
 import cv2
 import numpy as np
 
-from .metrics import Detection
+from .metrics import Detection, largest
 
 
 FSRCNN_X2_URL = (
@@ -19,6 +20,10 @@ FSRCNN_X2_URL = (
 FSRCNN_X2_SHA256 = (
     "366b33f0084c7b3f2bf6724f0a2c77bca94fcec9d7b6d72389d330073b380d5c"
 )
+LOCAL_SR_PADDING_RATIO = 0.20
+SUPPORTED_SR_SCALES = (2, 4, 8)
+DEFAULT_SR_TARGET_MIN_PX = 96
+DEFAULT_SR_MAX_INPUT_SIDE = 640
 
 
 @dataclass(frozen=True)
@@ -48,7 +53,7 @@ def select_super_resolution_target(
     The initial policy requested for the experiment is the largest bbox.
     """
 
-    return max(detections, key=lambda item: item.area_px, default=None)
+    return largest(detections)
 
 
 def expanded_crop_region(
@@ -56,8 +61,15 @@ def expanded_crop_region(
     frame_width: int,
     frame_height: int,
     *,
-    padding_ratio: float = 2.0,
+    padding_ratio: float = LOCAL_SR_PADDING_RATIO,
 ) -> CropRegion:
+    """Return a local crop with modest context around the target bbox.
+
+    The padding is applied once on each side.  A 20% ratio therefore produces
+    a crop that is approximately 1.4 times the bbox width and height, unless
+    the crop reaches a frame edge.
+    """
+
     padding_x = max(8, round(detection.width * padding_ratio))
     padding_y = max(8, round(detection.height * padding_ratio))
     x1 = max(0, detection.x - padding_x)
@@ -90,6 +102,54 @@ def remap_from_super_resolution(
         width=width,
         height=height,
         enhanced=True,
+        enhancement_scale=scale,
+    )
+
+
+def dynamic_super_resolution_scales(
+    detection: Detection,
+    region: CropRegion,
+    *,
+    target_min_px: int = DEFAULT_SR_TARGET_MIN_PX,
+    max_scale: int = 8,
+    max_input_side: int = DEFAULT_SR_MAX_INPUT_SIDE,
+) -> tuple[int, ...]:
+    """Choose an initial SR scale and the larger fallback scales to try.
+
+    The initial scale aims to make the target's shorter bbox side at least
+    ``target_min_px`` before YOLO preprocessing.  The local crop is kept near
+    ``max_input_side`` where possible so an unnecessarily large SR image is
+    not immediately reduced again by YOLO.  If no supported scale fits, x2 is
+    retained as the required minimum whenever SR is active.
+    """
+
+    if target_min_px <= 0:
+        raise ValueError("target_min_px must be greater than 0")
+    if max_scale not in SUPPORTED_SR_SCALES:
+        raise ValueError(f"max_scale must be one of {SUPPORTED_SR_SCALES}")
+    if max_input_side <= 0:
+        raise ValueError("max_input_side must be greater than 0")
+
+    supported = tuple(
+        scale for scale in SUPPORTED_SR_SCALES if scale <= max_scale
+    )
+    short_side = max(1, min(detection.width, detection.height))
+    required_scale = max(2, math.ceil(target_min_px / short_side))
+    preferred = next(
+        (scale for scale in supported if scale >= required_scale),
+        supported[-1],
+    )
+
+    region_long_side = max(1, region.width, region.height)
+    fitting = tuple(
+        scale
+        for scale in supported
+        if region_long_side * scale <= max_input_side
+    )
+    allowed_max = fitting[-1] if fitting else supported[0]
+    initial = min(preferred, allowed_max)
+    return tuple(
+        scale for scale in supported if initial <= scale <= allowed_max
     )
 
 
@@ -149,6 +209,7 @@ class LargestObjectInstabilityMonitor:
 
 class FSRCNNSuperResolution:
     scale = 2
+    max_scale = 8
 
     def __init__(
         self,
@@ -167,11 +228,20 @@ class FSRCNNSuperResolution:
     def ready(self) -> bool:
         return self._upsampler is not None
 
-    def enhance(self, image: np.ndarray) -> np.ndarray:
+    def enhance(self, image: np.ndarray, *, scale: int = 2) -> np.ndarray:
         if image.size == 0:
             raise ValueError("超解像へ渡す画像が空です")
+        if scale not in SUPPORTED_SR_SCALES:
+            raise ValueError(
+                f"超解像倍率は{SUPPORTED_SR_SCALES}から指定してください"
+            )
         upsampler = self._get_upsampler()
-        return upsampler.upsample(image)
+        enhanced = image
+        current_scale = 1
+        while current_scale < scale:
+            enhanced = upsampler.upsample(enhanced)
+            current_scale *= self.scale
+        return enhanced
 
     def _get_upsampler(self) -> Any:
         if self._upsampler is not None:
