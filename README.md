@@ -51,6 +51,34 @@ python .\yolo26_small_object_lab.py --model outputs\key_detector\key_o365_leftin
 
 オンラインのAndroidが見つからない場合は、エラーダイアログで知らせます。複数のAndroidがオンラインの場合は誤接続を防ぐため起動を止めるので、使用する1台だけをTailscaleへ接続してください。
 
+## 別のPCで使う
+
+PCがAndroidの映像を取りに行く方式なので、Android側の設定は変えずに別のPCから使えます。
+
+### 準備（初回だけ）
+
+```powershell
+git clone https://github.com/DaichiHiraoka/YOLO26SmallObjectLab.git
+cd YOLO26SmallObjectLab
+uv sync
+```
+
+- PCにTailscaleを入れ、Androidと**同じアカウント**でログインする。起動時に `tailscale status --json` でAndroidを探すので、`tailscale` コマンドが使える状態にする（通常のインストールで使えます）。
+- 初回起動時にWindowsのファイアウォール確認が出たら、プライベートネットワークで許可する。拒否すると映像は届きますが、アプリの「Start recording」が効きません（PCの結果画面の「記録開始」は使えます）。
+- 超解像モデル（FSRCNN）と `yolo26n.pt` は初回実行時に自動で取得します。正解の下書き作成（`propose`）で使う `yolo26x.pt` と `yolo26l.pt` も初回に自動でダウンロードします（合わせて数百MB）。
+
+### 注意
+
+- **同時に使うPCは1台だけ**にする。アプリの記録ボタンは、映像を取りに来たPCへ記録開始を送るため、2台で同時に起動するとどちらに届くか分からなくなります。
+- Tailscaleでオンラインにする**Androidも1台だけ**にする。
+- PyTorchはCUDA 13版を指定しています。NVIDIA GPUがない、またはドライバーが古いPCではCPUで動きますが、速度は大きく落ちます。処理時間の比較はPCごとに分けて扱ってください。
+- 記録は80秒で約0.7GBです。保存先はそのPCのリポジトリ内の `outputs/` です（Gitには含まれません）。
+
+### 動作確認
+
+1. 上の「起動手順」どおりに起動し、PCの結果画面に映像が出て、アプリの記録ボタンが押せることを確かめる。
+2. 短く1本記録し、[研究用ワークフロー](docs/RESEARCH_WORKFLOW.md) の `replay` と `evaluate` まで通ることを確かめる。
+
 ## android-camera-streamerの入力仕様
 
 Python側はandroid-camera-streamerのHTTP MJPEG映像を受信します。
