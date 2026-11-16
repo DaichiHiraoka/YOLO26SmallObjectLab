@@ -2,6 +2,7 @@ from small_object_lab.metrics import (
     Detection,
     StabilityTracker,
     intersection_over_union,
+    largest,
     smallest,
 )
 
@@ -48,3 +49,11 @@ def test_smallest_uses_bbox_area():
     narrow = detection(0, 0, 10, 25)
 
     assert smallest([large, narrow]) == narrow
+
+
+def test_largest_uses_bbox_area():
+    large = detection(0, 0, 30, 20)
+    narrow = detection(0, 0, 10, 25)
+
+    assert largest([narrow, large]) == large
+    assert largest([]) is None

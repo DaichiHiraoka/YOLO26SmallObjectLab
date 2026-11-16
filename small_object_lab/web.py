@@ -43,7 +43,10 @@ input, select, button, a.button {
 button, a.button { cursor: pointer; text-align: center; background: #163047; font-weight: 700; }
 button.primary { background: var(--accent); color: #052017; border-color: var(--accent); }
 button:hover, a.button:hover { filter: brightness(1.15); }
+button:disabled { opacity: .45; cursor: default; filter: none; }
 .row { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.check { display: flex; align-items: center; gap: 9px; }
+.check input { width: auto; }
 .actions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
 .small { font-size: .78rem; color: var(--muted); overflow-wrap: anywhere; }
 .error { color: var(--danger); min-height: 1.2em; }
@@ -56,6 +59,38 @@ code { color: #b7f7df; }
   .top { flex-direction: column; }
   .grid { grid-template-columns: 1fr; }
   .metrics { grid-template-columns: 1fr 1fr; }
+}
+"""
+
+
+# Shared by the PC dashboard and the phone page. Pages define poll() and #error.
+RECORDING_SCRIPT = """
+let recordingBusy = false;
+const RECORDING_LABELS = {waiting: "記録中（映像待ち）", recording: "記録中", limit_reached: "容量上限で停止", error: "記録エラー"};
+function showError(text) { const element = document.querySelector("#error"); if (element) element.textContent = text; }
+async function post(path, body = {}) {
+  const response = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "request failed");
+  return data;
+}
+function recordingSummary(r) {
+  const last = r.last;
+  if (!last) return {text: "記録していません", warn: false, busy: recordingBusy, state: "記録していません"};
+  let state = RECORDING_LABELS[last.state] || last.state;
+  if (last.closing) state = "記録を確定中";
+  else if (!r.active) state = last.complete ? "記録完了" : "記録エラー（未完了）";
+  if (last.state === "limit_reached" && !last.closing) state += "（容量上限）";
+  const error = last.errors.length ? ` / ${last.errors[last.errors.length - 1].message}` : "";
+  const text = `${state} / ${last.session_id} / ${last.duration_s.toFixed(1)}秒 / 保存 ${last.saved_frames}枚 / 欠落 ${last.dropped_frames}枚 / ${(last.bytes_written / 1024 ** 3).toFixed(2)} GiB${error}`;
+  const warn = last.dropped_frames > 0 || last.errors.length > 0 || last.state === "limit_reached";
+  return {text, warn, busy: recordingBusy || last.closing, state};
+}
+async function recordingAction(path) {
+  recordingBusy = true;
+  try { await post(path); showError(""); }
+  catch (e) { showError(e.message); }
+  finally { recordingBusy = false; poll(); }
 }
 """
 
@@ -84,10 +119,20 @@ DASHBOARD_HTML = f"""<!doctype html>
         <button onclick="action('/api/reset')">最小記録をリセット</button>
         <button onclick="action('/api/snapshot')">画像を保存</button>
         <a class="button" href="/api/detections.csv">検出CSV</a>
+        <a class="button" href="/api/frames.csv">フレームCSV</a>
       </div>
       <p id="autosave" class="small">15秒ごとに画像と測定状態を自動保存します。</p>
     </section>
     <aside class="stack">
+      <section class="panel">
+        <h2>元映像の記録</h2>
+        <div class="row">
+          <button id="recStart" class="primary" onclick="recordingAction('/api/recording/start')">記録開始</button>
+          <button id="recStop" onclick="recordingAction('/api/recording/stop')" disabled>記録終了</button>
+        </div>
+        <p id="recordingState" class="small">記録していません。開始から終了までが1つの撮影セッションです（1回につき最大10 GiB）。</p>
+        <p id="remoteUrl" class="small"></p>
+      </section>
       <section class="panel">
         <h2>推論設定</h2>
         <label>YOLO入力サイズ（大きいほど小物体に有利・低速）</label>
@@ -101,7 +146,22 @@ DASHBOARD_HTML = f"""<!doctype html>
         </div>
         <label>対象クラス（英語、カンマ区切り。空欄は全クラス）</label>
         <input id="classes" placeholder="cell phone, bottle, cup">
+        <label class="check"><input id="srEnabled" type="checkbox" checked>
+          不安定兆候時に最大bboxを局所超解像</label>
+        <div class="row">
+          <div><label>超解像を始めるconfidence以下</label>
+            <input id="srConfidence" type="number" min=".01" max=".99" step=".01" value=".45"></div>
+          <div><label>超解像を始めるbbox面積%以下</label>
+            <input id="srArea" type="number" min=".01" max="100" step=".01" value="1.00"></div>
+        </div>
+        <div class="row">
+          <div><label>超解像後の目標短辺px</label>
+            <input id="srTargetMinPx" type="number" min="16" max="320" step="8" value="96"></div>
+          <div><label>超解像の最大倍率</label>
+            <select id="srMaxScale"><option>2</option><option>4</option><option selected>8</option></select></div>
+        </div>
         <button class="primary" style="margin-top:12px" onclick="saveSettings()">設定を反映</button>
+        <p id="srState" class="small"></p>
         <div id="error" class="error small"></div>
       </section>
       <section class="panel">
@@ -140,32 +200,50 @@ async function poll() {{
     document.querySelector("#output").textContent = `保存先: ${{s.output_dir}}`;
     document.querySelector("#autosave").textContent =
       `${{s.auto_save_interval_sec}}秒ごとに自動保存 / 次回 ${{s.auto_save_in_sec}}秒後 / 保存 ${{s.auto_save_count}}件`;
-    document.querySelector("#error").textContent = s.error || "";
+    const recording = recordingSummary(s.recording);
+    const recordingElement = document.querySelector("#recordingState");
+    recordingElement.textContent = recording.text;
+    recordingElement.className = recording.warn ? "small error" : "small";
+    document.querySelector("#recStart").disabled = recording.busy || s.recording.active;
+    document.querySelector("#recStop").disabled = recording.busy || !s.recording.active;
+    document.querySelector("#remoteUrl").textContent = s.remote_url
+      ? `スマホから操作: ${{s.remote_url}}`
+      : "スマホから操作: 無効（PCのTailscale IPで待ち受けていません）";
+    const sr = s.super_resolution;
+    document.querySelector("#srState").textContent = sr.active
+      ? `FSRCNN x${{sr.scale}}実行 (${{sr.reason}}) / 試行 ${{sr.scales_tried.join("→")}} / ${{sr.inference_ms}} ms / 採用 ${{sr.adoptions}}/${{sr.attempts}}`
+      : `局所超解像待機 / x2〜x${{s.settings.sr_max_scale}} / 対象: 最大bbox / 採用 ${{sr.adoptions}}/${{sr.attempts}}`;
+    document.querySelector("#error").textContent = s.error || sr.error || "";
     document.querySelector("#detections").innerHTML = s.detections.length ? s.detections.map(d =>
-      `<tr><td>${{d.label}}</td><td>${{d.confidence}}</td><td>${{d.width_px}}×${{d.height_px}}</td><td>${{d.area_pct}}</td><td>${{d.streak}}/${{s.settings.stable_frames}}</td></tr>`
+      `<tr><td>${{d.label}}${{d.source === "super_resolution" ? " (SR)" : ""}}</td><td>${{d.confidence}}</td><td>${{d.width_px}}×${{d.height_px}}</td><td>${{d.area_pct}}</td><td>${{d.streak}}/${{s.settings.stable_frames}}</td></tr>`
     ).join("") : '<tr><td colspan="5">検出なし</td></tr>';
     if (!initialized) {{
       document.querySelector("#imgsz").value = s.settings.imgsz;
       document.querySelector("#confidence").value = s.settings.confidence;
       document.querySelector("#stable").value = s.settings.stable_frames;
       document.querySelector("#classes").value = s.settings.target_classes;
+      document.querySelector("#srEnabled").checked = s.settings.super_resolution_enabled;
+      document.querySelector("#srConfidence").value = s.settings.sr_trigger_confidence;
+      document.querySelector("#srArea").value = s.settings.sr_trigger_area_pct;
+      document.querySelector("#srTargetMinPx").value = s.settings.sr_target_min_px;
+      document.querySelector("#srMaxScale").value = s.settings.sr_max_scale;
       initialized = true;
     }}
   }} catch (e) {{ document.querySelector("#error").textContent = "状態取得失敗: " + e; }}
 }}
-async function post(path, body={{}}) {{
-  const response = await fetch(path, {{method:"POST", headers:{{"Content-Type":"application/json"}}, body:JSON.stringify(body)}});
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || "request failed");
-  return data;
-}}
+{RECORDING_SCRIPT}
 async function saveSettings() {{
   try {{
     await post("/api/settings", {{
       imgsz:+document.querySelector("#imgsz").value,
       confidence:+document.querySelector("#confidence").value,
       stable_frames:+document.querySelector("#stable").value,
-      target_classes:document.querySelector("#classes").value
+      target_classes:document.querySelector("#classes").value,
+      super_resolution_enabled:document.querySelector("#srEnabled").checked,
+      sr_trigger_confidence:+document.querySelector("#srConfidence").value,
+      sr_trigger_area_pct:+document.querySelector("#srArea").value,
+      sr_target_min_px:+document.querySelector("#srTargetMinPx").value,
+      sr_max_scale:+document.querySelector("#srMaxScale").value
     }}); document.querySelector("#error").textContent = "";
   }} catch(e) {{ document.querySelector("#error").textContent = e; }}
 }}
@@ -184,3 +262,51 @@ async function recordMeasurement() {{
 }}
 setInterval(poll, 500); poll();
 </script></body></html>"""
+
+
+# Phone page, opened over Tailscale: http://<PC Tailscale IP>:8765/remote
+REMOTE_HTML = (
+    """<!doctype html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>記録操作 - YOLO26 Small Object Lab</title><style>"""
+    + COMMON_STYLE
+    + """
+main { width: min(560px, 100%); padding: 16px; }
+.state { font-size: 1.6rem; font-weight: 800; margin: 4px 0; }
+.state.live { color: var(--danger); }
+.big { font-size: 1.35rem; padding: 22px 12px; margin-top: 12px; }
+</style></head>
+<body><main>
+  <div class="eyebrow">YOLO26 SMALL OBJECT LAB</div>
+  <h1>元映像の記録</h1>
+  <section class="panel" style="margin-top:14px">
+    <div id="state" class="state">接続中…</div>
+    <p id="detail" class="small"></p>
+    <p id="camera" class="small"></p>
+    <button id="recStart" class="primary big" onclick="recordingAction('/api/recording/start')" disabled>記録開始</button>
+    <button id="recStop" class="big" onclick="recordingAction('/api/recording/stop')" disabled>記録終了</button>
+    <div id="error" class="error small"></div>
+  </section>
+</main>
+<script>"""
+    + RECORDING_SCRIPT
+    + """
+async function poll() {
+  try {
+    const s = await (await fetch("/api/status", {cache: "no-store"})).json();
+    const recording = recordingSummary(s.recording);
+    const state = document.querySelector("#state");
+    state.textContent = s.recording.active ? "● " + recording.state : recording.state;
+    state.className = s.recording.active ? "state live" : "state";
+    const detail = document.querySelector("#detail");
+    detail.textContent = s.recording.last ? recording.text : "開始から終了までが1つの撮影セッションです。";
+    detail.className = recording.warn ? "small error" : "small";
+    document.querySelector("#camera").textContent = s.camera_connected ? "カメラ映像: 受信中" : `カメラ映像: ${s.status}`;
+    document.querySelector("#recStart").disabled = recording.busy || s.recording.active;
+    document.querySelector("#recStop").disabled = recording.busy || !s.recording.active;
+  } catch (e) { showError("状態取得失敗: " + e); }
+}
+setInterval(poll, 1000); poll();
+</script></body></html>"""
+)

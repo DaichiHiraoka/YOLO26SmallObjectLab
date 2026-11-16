@@ -9,6 +9,20 @@ import sys
 from pathlib import Path
 
 
+def _run_with_project_python(venv_python: Path) -> None:
+    # On Windows os.execv starts a detached child and returns to the shell,
+    # so Ctrl+C never reaches the app and the raw recording is left unfinished.
+    # Wait for the child instead; it receives Ctrl+C itself and finalizes.
+    process = subprocess.Popen(
+        [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]]
+    )
+    while True:
+        try:
+            raise SystemExit(process.wait())
+        except KeyboardInterrupt:
+            continue
+
+
 def _use_project_environment() -> None:
     project_dir = Path(__file__).resolve().parent
     os.chdir(project_dir)
@@ -17,7 +31,7 @@ def _use_project_environment() -> None:
         venv_python.exists()
         and Path(sys.executable).resolve() != venv_python.resolve()
     ):
-        os.execv(str(venv_python), [str(venv_python), str(Path(__file__).resolve())])
+        _run_with_project_python(venv_python)
     if venv_python.exists():
         return
 
@@ -27,7 +41,7 @@ def _use_project_environment() -> None:
             "Python環境がありません。PCへuvをインストールしてから再実行してください。"
         )
     subprocess.run([uv, "sync"], cwd=project_dir, check=True)
-    os.execv(str(venv_python), [str(venv_python), str(Path(__file__).resolve())])
+    _run_with_project_python(venv_python)
 
 
 if __name__ == "__main__":

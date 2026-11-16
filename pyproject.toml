@@ -6,7 +6,10 @@ readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "numpy",
+    "opencv-contrib-python",
     "opencv-python",
+    "torch==2.13.0; sys_platform == 'win32'",
+    "torchvision==0.28.0; sys_platform == 'win32'",
     "ultralytics>=8.4.0",
 ]
 
@@ -28,3 +31,16 @@ packages = ["small_object_lab"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+]
+torchvision = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

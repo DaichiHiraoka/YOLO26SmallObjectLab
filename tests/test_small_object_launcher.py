@@ -1,5 +1,21 @@
 from small_object_lab import launcher
-from small_object_lab.launcher import AndroidPeer, find_online_android_peers
+from small_object_lab.launcher import (
+    AndroidPeer,
+    find_online_android_peers,
+    find_self_tailscale_ipv4,
+)
+
+
+def test_find_self_tailscale_ipv4_for_phone_remote_control():
+    status = {
+        "Self": {
+            "OS": "windows",
+            "TailscaleIPs": ["fd7a:115c:a1e0::1", "100.70.1.2"],
+        }
+    }
+
+    assert find_self_tailscale_ipv4(status) == "100.70.1.2"
+    assert find_self_tailscale_ipv4({}) is None
 
 
 def test_find_online_android_peer_uses_tailscale_ipv4():
