@@ -60,7 +60,6 @@ PCがAndroidの映像を取りに行く方式なので、Android側の設定は�
 ```powershell
 git clone https://github.com/DaichiHiraoka/YOLO26SmallObjectLab.git
 cd YOLO26SmallObjectLab
-git switch codex/local-super-resolution   # mainへ統合するまでは、記録・比較・学習の機能はこのブランチにあります
 uv sync
 ```
 
