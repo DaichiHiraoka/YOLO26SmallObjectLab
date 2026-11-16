@@ -23,7 +23,7 @@ from ..metrics import Detection, intersection_over_union, plausible_replacement
 from ..super_resolution import (FSRCNNSuperResolution, dynamic_super_resolution_scales,
                                 expanded_crop_region, remap_from_super_resolution)
 from .sources import FrameSource, sha256_file
-from .tracking import TargetTracker
+from .tracking import TargetTracker, needs_enhancement
 
 
 @dataclass(frozen=True)
@@ -210,9 +210,9 @@ class MethodEngine:
         features = (self.tracker.features(target, timestamp_s, frame.shape[1], frame.shape[0], current is not None)
                     if target else {})
         feasible = available_actions(target, frame.shape, self.config)
-        trigger = bool(target and (current is None or target.confidence <= self.config.trigger_confidence
-                       or target.area_px * 100 / (frame.shape[0] * frame.shape[1]) <= self.config.trigger_area_pct
-                       or features["area_change"] <= -0.18 or features["confidence_change"] <= -0.15))
+        trigger = bool(target and needs_enhancement(features, missing=current is None,
+                                                    trigger_confidence=self.config.trigger_confidence,
+                                                    trigger_area_pct=self.config.trigger_area_pct))
         actions = [NONE]
         if trigger and self.method in {"fixed", "bicubic"}:
             fixed = Action("sr", self.config.fixed_padding, self.config.fixed_scale)

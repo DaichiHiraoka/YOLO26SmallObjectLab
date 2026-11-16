@@ -62,11 +62,18 @@ PNGはデコード後の画素を保持します。スマホが行ったJPEG圧�
 
 ## 3. 正解を確認
 
+まず、比較対象より大きい検出器（既定は `yolo26x.pt` と `yolo26l.pt`）で、正解枠の下書きを自動で作ります。全画面で見つからないフレームは直前の位置の周りを切り出して探し（超解像は使わない）、ほぼ動いていない2つの下書きの間の短い空白（15フレームまで）は補間します。下書きは正解ではありません。
+
 ```powershell
-.\.venv\Scripts\python.exe -m small_object_lab.research annotate outputs/yolo26_small_object_lab/<日時>/recordings/<記録ID> --output outputs/annotations/session_01.csv --label cup
+.\.venv\Scripts\python.exe -m small_object_lab.research propose outputs/yolo26_small_object_lab/<日時>/recordings/<記録ID> --output outputs/annotations/session_01.proposals.csv --label cup
+.\.venv\Scripts\python.exe -m small_object_lab.research annotate outputs/yolo26_small_object_lab/<日時>/recordings/<記録ID> --output outputs/annotations/session_01.csv --label cup --proposals outputs/annotations/session_01.proposals.csv --stride 3
 ```
 
-操作: Rで枠を描く、Sで確認保存して次へ、Iで完全不可視/不在を確認して次へ、Nで未確認のまま次へ、Pで戻る、Cで直前の枠を下書きとしてコピー、Uで未確認に戻す、Qで終了。Rの枠選択はEnter/Spaceで確定、Escで取消。保存後は途中から再開できます。枠のコピーだけでは確認済みになりません。画面には英字で操作を表示します。
+`--proposals` を付けると、最初に下書きを12枚ずつ並べた画面が開きます。枠がずれている・大きすぎる・別の物を囲んでいるタイルをクリックして赤い×を付け、Space（またはEnter）でそのページの残りを確定します。Pで前のページ、Qで終了（途中から再開可）。×を付けたフレームと下書きのないフレームは、次に画面全体を8枚ずつ並べた画面に出ます。対象が少しでも見えるフレームだけをクリックしてオレンジ枠を付け、Spaceで残りを「対象なし」として確定します。オレンジ枠のフレームは、最後に1枚ずつの画面で手で囲みます。どの方法で確定したか（下書きをそのまま採用・1枚ずつの画面で確認・手で描画・一覧で不在を確認・1枚ずつ不可視）は `session_01.csv.review.json` に記録されるので、卒論では「下書きのうち何%をそのまま採用したか」を報告できます。
+
+下書きのないフレームは、大きい検出器でも見つけにくい、評価で重要なフレームです。省略すると評価が簡単なフレームに偏るので、`--stride` は下書きの有無に関係なく同じ間隔で適用します。鍵の場合、COCOの検出器には鍵のクラスがないため `--models` に鍵の検出器を指定しますが、比較に使う検出器と同じになる点を結果の考察で明記してください。
+
+操作: Rで枠を描く、Sで確認保存して次へ、Iで完全不可視/不在を確認して次へ、Nで未確認のまま次へ（保存されず、採点にも使われません）、Pで戻る、Cで直前の枠を下書きとしてコピー、Uで未確認に戻す、Qで終了。Rの枠選択はEnter/Spaceで確定、Escで取消。保存後は途中から再開できます。枠のコピーだけでは確認済みになりません。画面には英字で操作を表示します。
 
 `--start-frame`・`--end-frame` で確認するフレームの範囲を、`--stride 3` のように間引き（3フレームに1枚）を指定できます。範囲外・間引いたフレームは未確認のまま残り、採点されません。鍵の場合は、鍵・リング・カラビナ・キーホルダーをまとめた鍵束全体を1つの枠で囲みます。
 
@@ -106,6 +113,12 @@ CSVだけの雛形が必要なら `annotate` を `annotation-template` に置き
 ```
 
 学習器は、bbox比率・信頼度・正規化移動速度・欠落時間・面積と信頼度の変化から、候補ごとの成績を予測する軽量ridge回帰です。報酬は正解との一致（1または0）から追加処理時間×既定0.002を引きます。閾値やペナルティは調整用データで決め、最終評価前に固定します。信頼度の高さ自体を正解にはしません。
+
+学習に使うのは、実行時に学習器が実際に選ぶフレーム（対象があり、局所処理の候補があり、固定・ルール方式と共通の拡大条件 `needs_enhancement` が成立するフレーム）だけです（`--frames decision`、既定）。対象のいないフレームまで含めると「何もしない」が過大評価され、拡大を控えすぎて追跡が途切れます。通常検出が今のフレームで何も見つけていないとき、「何もしない」の成績は推定せず0とします。`--ridge-alpha` は行動ごとの推定の縮小の強さで、候補が24通りあり学習フレームが数百の規模では、既定の1だと過学習します。カップの調整用データでは `--ridge-alpha 1000 --latency-penalty 0.0005` を選びました。
+
+```powershell
+.\.venv\Scripts\python.exe -m small_object_lab.research train-selector outputs/dataset_v1/samples.jsonl outputs/dataset_v1/annotations.csv outputs/dataset_v1/split.json --ridge-alpha 1000 --latency-penalty 0.0005 --output outputs/models/selector_v1.json
+```
 
 学習と標準化はtrainだけ、モデル内の参考成績はvalidationだけで計算します。testは学習・調整に使用しません。学習に使った同じsession_idの通常評価は拒否します。モデル出力は透明なJSONで、重みや学習セッション、分割、学習入力のハッシュを残します。モデルが学習していない候補は選びません。
 

@@ -19,7 +19,7 @@ GT_FIELDS = (
 
 def features(width=0.05):
     values = dict.fromkeys(FEATURE_NAMES, 0.0)
-    values.update(width_frac=width, height_frac=0.1, confidence=0.8)
+    values.update(width_frac=width, height_frac=0.1, confidence=0.3)  # low enough to trigger enhancement
     return values
 
 
@@ -211,3 +211,45 @@ def test_model_json_is_validated_before_inference(tmp_path):
     paths[-1].write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="positive"):
         LearnedSelector.load(paths[-1])
+
+
+def test_decision_frames_only_trains_where_the_trigger_fires(tmp_path):
+    confident = row(frame=2)
+    confident["features"].update(confidence=0.9, width_frac=0.5, height_frac=0.5)  # no trigger
+    unavailable = row(frame=3)
+    unavailable["target_available"] = False
+    only_none = row(frame=4)
+    only_none["candidates"] = only_none["candidates"][:1]
+    samples = [row(frame=1), confident, unavailable, only_none]
+    paths = inputs(tmp_path, samples)
+    report = train_selector(*paths)
+    assert report["train_sample_count"] == 1
+    assert report["non_decision_frames_excluded"] == {"train": 3, "validation": 0}
+    everything = inputs(tmp_path / "all", samples) if (tmp_path / "all").mkdir() is None else None
+    assert train_selector(*everything, frames="all")["train_sample_count"] == 4
+
+
+def test_runner_and_selector_share_one_trigger():
+    from small_object_lab.research.tracking import needs_enhancement
+    settings = dict(trigger_confidence=0.45, trigger_area_pct=1.0)
+    assert not needs_enhancement(dict(features(0.5), confidence=0.9, height_frac=0.5), missing=False, **settings)
+    assert needs_enhancement(dict(features(0.5), confidence=0.9, height_frac=0.5), missing=True, **settings)
+    assert needs_enhancement(dict(features(0.05), confidence=0.9), missing=False, **settings)  # 0.5% of the frame
+
+
+def test_doing_nothing_is_worth_zero_when_the_detector_missed(tmp_path):
+    # train says 'none' is always right, but a missed frame has nothing to keep
+    samples = [row(frame=i, sr_correct=False) for i in range(1, 11)]
+    paths = inputs(tmp_path, samples)
+    train_selector(*paths)
+    model = LearnedSelector.load(paths[-1])
+    assert model.choose(features(), ["none", SR]) == "none"
+    missed = dict(features(), missed_s=0.2)
+    assert model.choose(missed, ["none", SR]) == (SR if model._utility(SR, *_design(model, missed)) > 0 else "none")
+
+
+def _design(model, values):
+    import numpy as np
+    from small_object_lab.research.selector import _feature_vector
+    vector = np.clip((_feature_vector(values) - model.mean) / model.scale, -20, 20)
+    return np.concatenate(([1.0], vector)), values

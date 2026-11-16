@@ -29,7 +29,7 @@ def test_candidate_collection_annotation_assembly_train_and_held_out_replay(tmp_
     split = dataset / "split.json"
     split.write_text(json.dumps({"train": [source.session_id], "validation": [], "test": ["held-out"]}))
     model_path = dataset / "selector.json"
-    train_selector(dataset / "samples.jsonl", dataset / "annotations.csv", split, model_path)
+    train_selector(dataset / "samples.jsonl", dataset / "annotations.csv", split, model_path, frames="all")
     model = LearnedSelector.load(model_path)
     assert model.payload["experiment_config"]["confidence"] == 0.2
     other = tmp_path / "test"
@@ -42,7 +42,7 @@ def test_candidate_collection_annotation_assembly_train_and_held_out_replay(tmp_
     with pytest.raises(ValueError, match="configuration"):
         run_experiment(test_source, other / "bad", FakeBackend(), ExperimentConfig(confidence=0.1), methods=("learned",), selector=model)
     with pytest.raises(FileExistsError):
-        train_selector(dataset / "samples.jsonl", dataset / "annotations.csv", split, model_path)
+        train_selector(dataset / "samples.jsonl", dataset / "annotations.csv", split, model_path, frames="all")
     with pytest.raises(ValueError, match="Duplicate"):
         assemble_dataset([run, run], [gt], tmp_path / "duplicate")
 

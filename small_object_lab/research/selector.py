@@ -20,6 +20,10 @@ from pathlib import Path
 import numpy as np
 
 from .evaluation import box_iou, load_annotations
+from .tracking import needs_enhancement
+
+# trigger defaults of ExperimentConfig, for samples recorded without their configuration
+DEFAULT_TRIGGER = {"trigger_confidence": 0.45, "trigger_area_pct": 1.0}
 
 
 FEATURE_NAMES = (
@@ -163,6 +167,19 @@ def _candidate_outcome(candidate: dict, annotation: dict, penalty: float) -> dic
     }
 
 
+def is_decision_frame(row: dict) -> bool:
+    """Frames where the run-time selector is actually asked: a target exists, some local
+    action is feasible, and the shared enhancement trigger fires."""
+    if row.get("target_available") is False or len(row.get("candidates") or []) < 2:
+        return False
+    config = {**DEFAULT_TRIGGER, **(row.get("experiment_config") or {})}
+    features = row.get("features")
+    _feature_vector(features)
+    return needs_enhancement(features, missing=float(features["missed_s"]) > 0,
+                             trigger_confidence=float(config["trigger_confidence"]),
+                             trigger_area_pct=float(config["trigger_area_pct"]))
+
+
 def _prepare(rows: list, annotations: dict, penalty: float) -> tuple[list, int]:
     prepared = []
     skipped = 0
@@ -244,7 +261,14 @@ class LearnedSelector:
             raise ValueError("No available action was observed in training")
         # Deterministic ties prefer the zero-additional-cost baseline.
         ordered = sorted(known, key=lambda action: (action != "none", action))
-        return max(ordered, key=lambda action: float(self.coefficients[action] @ design))
+        return max(ordered, key=lambda action: self._utility(action, design, features))
+
+    def _utility(self, action: str, design: np.ndarray, features: dict) -> float:
+        # When the full-frame detector found nothing this frame, doing nothing cannot
+        # produce a detection: its utility is exactly 0, so it is not estimated.
+        if action == "none" and float(features["missed_s"]) > 0:
+            return 0.0
+        return float(self.coefficients[action] @ design)
 
 
 def _validation_report(selector: LearnedSelector, rows: list) -> dict:
@@ -276,14 +300,27 @@ def _validation_report(selector: LearnedSelector, rows: list) -> dict:
 
 def train_selector(
     samples_path: Path, annotations_path: Path, split_path: Path, output_path: Path,
-    *, latency_penalty: float = 0.002,
+    *, latency_penalty: float = 0.002, frames: str = "decision", ridge_alpha: float = RIDGE_ALPHA,
 ) -> dict:
     """Fit on reviewed train frames; report validation only; leave test untouched."""
     penalty = _finite(latency_penalty, "latency_penalty")
     if penalty < 0:
         raise ValueError("latency_penalty must be nonnegative")
+    ridge_alpha = _finite(ridge_alpha, "ridge_alpha")
+    if ridge_alpha <= 0:
+        raise ValueError("ridge_alpha must be positive")
+    if frames not in {"decision", "all"}:
+        raise ValueError("frames must be 'decision' or 'all'")
     split = _load_split(split_path)
     samples, test_count = _load_samples(samples_path, split)
+    excluded = {}
+    if frames == "decision":
+        # Fit and validate on the same frame population the selector faces at run time;
+        # otherwise 'none' is learned mostly from easy, untriggered frames.
+        for group in ("train", "validation"):
+            kept = [row for row in samples[group] if is_decision_frame(row)]
+            excluded[group] = len(samples[group]) - len(kept)
+            samples[group] = kept
     configurations = {json.dumps(row["experiment_config"], sort_keys=True)
                       for group in ("train", "validation") for row in samples[group]
                       if "experiment_config" in row}
@@ -302,10 +339,14 @@ def train_selector(
     design = np.column_stack((np.ones(len(train)), standardized))
     actions = sorted({action for row in train for action in row["outcomes"]})
     fitted = {}
-    regularizer = np.eye(design.shape[1]) * RIDGE_ALPHA
+    regularizer = np.eye(design.shape[1]) * ridge_alpha
     regularizer[0, 0] = 0.0
     for action in actions:
-        indices = [i for i, row in enumerate(train) if action in row["outcomes"]]
+        # 'none' is only estimated where the detector saw something (see LearnedSelector._utility)
+        indices = [i for i, row in enumerate(train) if action in row["outcomes"]
+                   and (action != "none" or float(row["features"]["missed_s"]) == 0)]
+        if not indices:
+            indices = [i for i, row in enumerate(train) if action in row["outcomes"]]
         action_design = design[indices]
         targets = np.asarray([train[i]["outcomes"][action]["utility"] for i in indices])
         coefficients = np.linalg.solve(
@@ -315,8 +356,8 @@ def train_selector(
     payload = {
         "format": MODEL_FORMAT, "created_at": datetime.now(timezone.utc).isoformat(),
         "feature_names": list(FEATURE_NAMES), "feature_mean": mean.tolist(),
-        "feature_scale": scale.tolist(), "ridge_alpha": RIDGE_ALPHA,
-        "feature_clip": FEATURE_CLIP, "latency_penalty": penalty,
+        "feature_scale": scale.tolist(), "ridge_alpha": ridge_alpha,
+        "feature_clip": FEATURE_CLIP, "latency_penalty": penalty, "training_frames": frames,
         "objective": "visible_same_label_iou_ge_0.5_minus_additional_ms_penalty",
         "training_session_ids": sorted({row["session_id"] for row in train}),
         "split": split, "actions": fitted,
@@ -331,6 +372,7 @@ def train_selector(
         "train_skipped_unreviewed_or_missing": train_skipped,
         "validation_skipped_unreviewed_or_missing": validation_skipped,
         "test_samples_not_used": test_count,
+        "training_frames": frames, "non_decision_frames_excluded": excluded,
         "latency_penalty": penalty,
         "action_sample_counts": {key: value["sample_count"] for key, value in fitted.items()},
         "validation": _validation_report(selector, validation),

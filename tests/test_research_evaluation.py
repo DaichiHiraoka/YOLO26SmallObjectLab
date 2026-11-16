@@ -183,8 +183,10 @@ def test_duplicate_rows_changed_identity_and_bad_timestamps_rejected(tmp_path):
         evaluate(tmp_path, [prediction(0), prediction(0)], [annotation(0)])
     with pytest.raises(ValueError, match="one fixed object_id"):
         evaluate(tmp_path, [prediction(0)], [annotation(0), annotation(1, object_id="different")])
-    with pytest.raises(ValueError, match="timestamps must increase"):
-        evaluate(tmp_path, [prediction(0), prediction(1, timestamp_s=0)], [annotation(0)])
+    with pytest.raises(ValueError, match="timestamps must not decrease"):
+        evaluate(tmp_path, [prediction(0, timestamp_s=0.2), prediction(1, timestamp_s=0.1)], [annotation(0)])
+    # two frames received in the same clock tick share a timestamp
+    evaluate(tmp_path, [prediction(0), prediction(1, timestamp_s=0)], [annotation(0)])
 
 
 def test_iou_matches_geometry():

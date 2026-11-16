@@ -148,8 +148,9 @@ def _load_predictions(path: Path) -> dict[tuple[str, str], dict[int, dict[str, A
     for key, predictions in groups.items():
         ordered = [predictions[frame] for frame in sorted(predictions)]
         times = [item["timestamp_s"] for item in ordered]
-        if any(right <= left for left, right in zip(times, times[1:])):
-            raise ValueError(f"{path}: timestamps must increase with frame_id for {key}")
+        # equal receipt times occur when two frames arrive in one clock tick; going back in time is invalid
+        if any(right < left for left, right in zip(times, times[1:])):
+            raise ValueError(f"{path}: timestamps must not decrease with frame_id for {key}")
     return dict(groups)
 
 

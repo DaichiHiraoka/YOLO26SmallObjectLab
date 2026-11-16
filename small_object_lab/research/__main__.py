@@ -44,6 +44,17 @@ def parser() -> argparse.ArgumentParser:
             annotation.add_argument("--start-frame", type=int, help="First frame_id to review")
             annotation.add_argument("--end-frame", type=int, help="Last frame_id to review")
             annotation.add_argument("--stride", type=int, default=1, help="Review every Nth frame in the range")
+            annotation.add_argument("--proposals", type=Path,
+                                    help="Draft boxes from 'propose': accept/reject them in a grid first")
+    propose = sub.add_parser("propose", help="Draft boxes with larger detectors for human review (not ground truth)")
+    propose.add_argument("source", type=Path)
+    propose.add_argument("--output", required=True, type=Path)
+    propose.add_argument("--label", default="cup")
+    propose.add_argument("--models", nargs="+", default=["yolo26x.pt", "yolo26l.pt"],
+                         help="Draft detectors; use models other than the one being compared")
+    propose.add_argument("--imgsz", type=int, default=1280)
+    propose.add_argument("--device", default="auto")
+    propose.add_argument("--allow-incomplete", action="store_true")
     evaluate = sub.add_parser("evaluate", help="Score predictions against reviewed ground truth")
     evaluate.add_argument("predictions", type=Path)
     evaluate.add_argument("annotations", type=Path)
@@ -55,6 +66,10 @@ def parser() -> argparse.ArgumentParser:
     train.add_argument("split", type=Path)
     train.add_argument("--output", type=Path, required=True)
     train.add_argument("--latency-penalty", type=float, default=0.002)
+    train.add_argument("--ridge-alpha", type=float, default=1.0,
+                       help="Shrinkage of each action's utility model; choose it on validation sessions")
+    train.add_argument("--frames", choices=("decision", "all"), default="decision",
+                       help="decision: only frames where the enhancement trigger fires (as at run time)")
     assemble = sub.add_parser("assemble", help="Combine candidate runs and reviewed annotation files")
     assemble.add_argument("--runs", nargs="+", type=Path, required=True)
     assemble.add_argument("--annotations", nargs="+", type=Path, required=True)
@@ -89,11 +104,19 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "annotate":
                 from .annotation import review_annotations
                 review_annotations(source, args.output, label=args.label, start_frame=args.start_frame,
-                                   end_frame=args.end_frame, stride=args.stride)
+                                   end_frame=args.end_frame, stride=args.stride, proposals_path=args.proposals)
             else:
                 count = create_annotation_template(source, args.output, label=args.label)
                 print(json.dumps({"session_id": source.session_id, "unreviewed_frames": count,
                                   "output": str(args.output.resolve())}, ensure_ascii=False))
+        elif args.command == "propose":
+            from .proposals import combined_predictor, write_proposals, yolo_predictor
+            source = FrameSource(args.source, allow_incomplete=args.allow_incomplete)
+            root = Path(__file__).resolve().parents[2]
+            models = [str(root / m) if (root / m).exists() else m for m in args.models]
+            predict = combined_predictor([yolo_predictor(m, args.label, args.device) for m in models])
+            print(json.dumps(write_proposals(source, args.output, predict, model_name="+".join(args.models),
+                                             label=args.label, imgsz=args.imgsz), ensure_ascii=False, indent=2))
         elif args.command == "evaluate":
             from .evaluation import evaluate_predictions
             result = evaluate_predictions(args.predictions, args.annotations, iou_threshold=args.iou)
@@ -104,7 +127,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "train-selector":
             from .selector import train_selector
             result = train_selector(args.samples, args.annotations, args.split, args.output,
-                                    latency_penalty=args.latency_penalty)
+                                    latency_penalty=args.latency_penalty, frames=args.frames,
+                                    ridge_alpha=args.ridge_alpha)
             print(json.dumps(result, ensure_ascii=False, indent=2))
         elif args.command == "assemble":
             from .dataset import assemble_dataset

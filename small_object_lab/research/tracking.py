@@ -83,3 +83,13 @@ class TargetTracker:
             "confidence_change": (target.confidence - self.last.confidence
                                   if current and self.last else self.confidence_change),
         }
+
+
+def needs_enhancement(features: dict, *, missing: bool, trigger_confidence: float, trigger_area_pct: float) -> bool:
+    """The shared trigger: whether fixed/bicubic/rule/learned try a local enhancement for this target.
+
+    The learned selector is trained only on frames where this fires, because those are
+    the only frames where it chooses at run time."""
+    return bool(missing or features["confidence"] <= trigger_confidence
+                or features["width_frac"] * features["height_frac"] * 100 <= trigger_area_pct
+                or features["area_change"] <= -0.18 or features["confidence_change"] <= -0.15)
