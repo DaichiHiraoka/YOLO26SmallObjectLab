@@ -122,6 +122,19 @@ CSVだけの雛形が必要なら `annotate` を `annotation-template` に置き
 
 学習と標準化はtrainだけ、モデル内の参考成績はvalidationだけで計算します。testは学習・調整に使用しません。学習に使った同じsession_idの通常評価は拒否します。モデル出力は透明なJSONで、重みや学習セッション、分割、学習入力のハッシュを残します。モデルが学習していない候補は選びません。
 
+## 5. FSRCNN以外の超解像モデルを試す
+
+[10月のレポート](REPORT_202610.md) 7.2節の候補のうち、OpenCVで読めるESPCN・LapSRN・EDSRを、撮影済みの記録で比べます。モデルは初回に `models/` へ自動で取得し、SHA-256を検証します。SPAN・RLFNなどは未対応です。
+
+```powershell
+.\.venv\Scripts\python.exe scripts\compare_sr_models.py outputs/yolo26_small_object_lab/<日時>/recordings/<記録ID> outputs/research/<比較実行>/predictions.csv --weights outputs/key_detector/key_o365_leftincar_all_zoom_v1/weights/last.pt --threads 4 --output outputs/research/sr_models_01.json
+```
+
+- 標本は `scripts/probe_enlargement.py` と同じです（遠い実映像の鍵と、鮮明なフレームを縮小した鍵。正解は比較実行のbaselineの検出で、人が確認した正解枠ではありません）。
+- 切り出しのみ・bicubic・FSRCNN（現行）・指定したモデルを、同じ切り出し（余白100%）で比べます。既定はESPCNとLapSRN、倍率はx2とx4です。EDSRは非常に重いので、上限の参考にするときだけ `--models espcn lapsrn edsr` で加えます。
+- 表示する時間は拡大処理だけの中央値で、CPU（OpenCV）で計測します。`--threads` でスレッド数を制限できます。
+- 鍵の検出器はbicubicとFSRCNNの拡大画像を混ぜて学習しているので、ほかのモデルは不利です。`--weights` に別の検出器を並べるか、COCOのモデルを `--label` 付きで指定して、順位が検出器1つに依存していないかを確かめてください。
+
 ## 現時点で本人の作業を待つ部分
 
 - 新しい枠なし元映像の収集と正解注釈の確認。

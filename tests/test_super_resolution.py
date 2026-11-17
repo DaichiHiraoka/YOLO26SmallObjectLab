@@ -7,8 +7,10 @@ from small_object_lab.metrics import Detection
 from small_object_lab.super_resolution import (
     FSRCNNSuperResolution,
     LargestObjectInstabilityMonitor,
+    OpenCVSuperResolution,
     dynamic_super_resolution_scales,
     expanded_crop_region,
+    native_scale_steps,
     remap_from_super_resolution,
     select_super_resolution_target,
 )
@@ -158,6 +160,26 @@ def test_fsrcnn_enhancer_cascades_x2_model_up_to_x8():
     assert engine.enhance(image).shape == (24, 40, 3)
     assert engine.enhance(image, scale=4).shape == (48, 80, 3)
     assert engine.enhance(image, scale=8).shape == (96, 160, 3)
+
+
+def test_alternative_models_use_native_scale_and_compose_the_rest():
+    assert native_scale_steps(8, {2, 4, 8}) == (8,)
+    assert native_scale_steps(8, {2, 4}) == (4, 2)
+    assert native_scale_steps(4, {2}) == (2, 2)
+
+    class FakeUpsampler:
+        def __init__(self, scale):
+            self.scale = scale
+
+        def upsample(self, image):
+            return np.repeat(np.repeat(image, self.scale, axis=0), self.scale, axis=1)
+
+    engine = OpenCVSuperResolution("edsr")
+    used = []
+    engine._upsampler = lambda scale: used.append(scale) or FakeUpsampler(scale)
+
+    assert engine.enhance(np.zeros((12, 20, 3), dtype=np.uint8), scale=8).shape == (96, 160, 3)
+    assert used == [4, 2]
 
 
 def test_lab_adopts_higher_confidence_local_super_resolution_detection(tmp_path):

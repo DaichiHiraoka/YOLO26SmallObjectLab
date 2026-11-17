@@ -293,3 +293,123 @@ class FSRCNNSuperResolution:
                 "FSRCNNモデルのSHA-256が一致しません。"
                 f" expected={self.expected_sha256} actual={digest}"
             )
+
+
+@dataclass(frozen=True)
+class SuperResolutionModelSpec:
+    """Published OpenCV dnn_superres weights, keyed by their native scale."""
+
+    algorithm: str
+    url: str
+    sha256: dict[int, str]
+
+
+_RAW = "https://raw.githubusercontent.com/"
+SR_MODEL_SPECS = {
+    "espcn": SuperResolutionModelSpec(
+        "espcn",
+        _RAW + "fannymonori/TF-ESPCN/master/export/ESPCN_x{scale}.pb",
+        {
+            2: "59f77351e1d7c0057bf6fe088b4a8a07e42c468c8c8aebb674a6b4ea1823221d",
+            4: "e403f06309229cf36009cd8fb0da032ba7643fae9f15cf94fe562e8edf8fef47",
+        },
+    ),
+    "lapsrn": SuperResolutionModelSpec(
+        "lapsrn",
+        _RAW + "fannymonori/TF-LapSRN/master/export/LapSRN_x{scale}.pb",
+        {
+            2: "f59c86e6835bbca646dbd81588f07820dfe3bd09e3702976ae2d90b5fc0f0b21",
+            4: "d3e95c93cafae5ce5a8ed57ce9abf07f2de58da8c5d6d656b766774969835ee2",
+            8: "a00211938b2b4c7d23691525a9267d9d0bbb345cdb9f38a7fc917414a5a1884f",
+        },
+    ),
+    "edsr": SuperResolutionModelSpec(
+        "edsr",
+        _RAW + "Saafke/EDSR_Tensorflow/master/models/EDSR_x{scale}.pb",
+        {
+            2: "585623221baa070279a0d1e7e113a4c3faba0f318ca7fdd9a65d9afc0763d9b4",
+            4: "dd35ce3cae53ecee2d16045e08a932c3e7242d641bb65cb971d123e06904347f",
+        },
+    ),
+}
+
+
+def native_scale_steps(scale: int, native: Iterable[int]) -> tuple[int, ...]:
+    """Split a scale into the fewest passes of the natively trained scales."""
+
+    steps: list[int] = []
+    remaining = scale
+    for step in sorted(native, reverse=True):
+        while remaining > 1 and remaining % step == 0:
+            steps.append(step)
+            remaining //= step
+    if remaining != 1:
+        raise ValueError(f"x{scale}を学習済み倍率{sorted(native)}で構成できません")
+    return tuple(steps)
+
+
+class OpenCVSuperResolution:
+    """Alternatives to FSRCNN (ESPCN, LapSRN, EDSR) for offline comparison.
+
+    Unlike ``FSRCNNSuperResolution``, which repeats its x2 model, each scale
+    uses the model trained for it where one is published (e.g. EDSR x8 is
+    x4 followed by x2).
+    """
+
+    def __init__(self, name: str, model_dir: Path = Path("models")) -> None:
+        if name not in SR_MODEL_SPECS:
+            raise ValueError(f"超解像モデルは{sorted(SR_MODEL_SPECS)}から指定してください")
+        self.name = name
+        self.spec = SR_MODEL_SPECS[name]
+        self.model_dir = model_dir
+        self._upsamplers: dict[int, Any] = {}
+
+    def enhance(self, image: np.ndarray, *, scale: int = 2) -> np.ndarray:
+        if image.size == 0:
+            raise ValueError("超解像へ渡す画像が空です")
+        for step in native_scale_steps(scale, self.spec.sha256):
+            image = self._upsampler(step).upsample(image)
+        return image
+
+    def _upsampler(self, scale: int) -> Any:
+        if scale not in self._upsamplers:
+            module = getattr(cv2, "dnn_superres", None)
+            if module is None:
+                raise RuntimeError(
+                    "OpenCVのdnn_superresが利用できません。"
+                    "uv syncを再実行してください。"
+                )
+            upsampler = module.DnnSuperResImpl_create()
+            upsampler.readModel(str(self._ensure_model_file(scale)))
+            upsampler.setModel(self.spec.algorithm, scale)
+            self._upsamplers[scale] = upsampler
+        return self._upsamplers[scale]
+
+    def _ensure_model_file(self, scale: int) -> Path:
+        url = self.spec.url.format(scale=scale)
+        path = self.model_dir / url.rsplit("/", 1)[1]
+        if not path.exists():
+            request = urllib.request.Request(
+                url, headers={"User-Agent": "YOLO26SmallObjectLab/0.1"}
+            )
+            with urllib.request.urlopen(request, timeout=120) as response:
+                payload = response.read()
+            self._verify(payload, scale, path.name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path = path.with_suffix(".pb.download")
+            try:
+                temporary_path.write_bytes(payload)
+                temporary_path.replace(path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+        else:
+            self._verify(path.read_bytes(), scale, path.name)
+        return path
+
+    def _verify(self, payload: bytes, scale: int, name: str) -> None:
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest != self.spec.sha256[scale]:
+            raise RuntimeError(
+                f"{name}のSHA-256が一致しません。"
+                f" expected={self.spec.sha256[scale]} actual={digest}"
+            )
