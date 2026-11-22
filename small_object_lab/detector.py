@@ -38,7 +38,7 @@ from .super_resolution import (
 class LabSettings:
     confidence: float = 0.20
     imgsz: int = 960
-    target_classes: str = ""
+    target_classes: str = "cup"  # the research target; empty means every class
     stable_frames: int = 3
     super_resolution_enabled: bool = True
     sr_trigger_confidence: float = 0.45

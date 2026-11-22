@@ -9,10 +9,23 @@ import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .detector import SmallObjectLab
 from .web import DASHBOARD_HTML, REMOTE_HTML
+
+
+def stream_fps(value: str | None) -> float | None:
+    """Optional frame-rate cap for /api/stream (?fps=N, 0 < N <= 30)."""
+    if value is None or value == "":
+        return None
+    try:
+        fps = float(value)
+    except ValueError:
+        raise ValueError("fpsは数値で指定してください") from None
+    if not 0 < fps <= 30:
+        raise ValueError("fpsは0より大きく30以下で指定してください")
+    return fps
 
 
 class LabHTTPServer(ThreadingHTTPServer):
@@ -27,7 +40,8 @@ class LabRequestHandler(BaseHTTPRequestHandler):
     server: LabHTTPServer
 
     def do_GET(self) -> None:
-        path = urlparse(self.path).path
+        url = urlparse(self.path)
+        path = url.path
         if path == "/":
             self._html(DASHBOARD_HTML)
         elif path == "/remote":
@@ -35,7 +49,12 @@ class LabRequestHandler(BaseHTTPRequestHandler):
         elif path == "/api/status":
             self._json(HTTPStatus.OK, self.server.lab.status())
         elif path == "/api/stream":
-            self._mjpeg_stream()
+            try:
+                max_fps = stream_fps(parse_qs(url.query).get("fps", [None])[0])
+            except ValueError as error:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                return
+            self._mjpeg_stream(max_fps)
         elif path == "/api/detections.csv":
             self._file(self.server.lab.csv_path, "text/csv; charset=utf-8")
         elif path == "/api/frames.csv":
@@ -108,7 +127,7 @@ class LabRequestHandler(BaseHTTPRequestHandler):
         except ValueError:
             return 0
 
-    def _mjpeg_stream(self) -> None:
+    def _mjpeg_stream(self, max_fps: float | None = None) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header(
             "Content-Type", "multipart/x-mixed-replace; boundary=frame"
@@ -116,11 +135,20 @@ class LabRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.end_headers()
         previous_payload: bytes | None = None
+        # Phones on mobile data ask for fewer frames (?fps=10) to save bandwidth.
+        interval = 1.0 / max_fps if max_fps else 0.0
+        next_send = 0.0
         try:
             while True:
                 with self.server.lab.lock:
                     payload = self.server.lab.latest_jpeg
-                if payload is not None and payload is not previous_payload:
+                now = time.monotonic()
+                if (
+                    payload is not None
+                    and payload is not previous_payload
+                    and now >= next_send
+                ):
+                    next_send = now + interval
                     self.wfile.write(b"--frame\r\n")
                     self.wfile.write(b"Content-Type: image/jpeg\r\n")
                     self.wfile.write(

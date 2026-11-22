@@ -23,6 +23,7 @@ from ..metrics import Detection, intersection_over_union, plausible_replacement
 from ..super_resolution import (FSRCNNSuperResolution, dynamic_super_resolution_scales,
                                 expanded_crop_region, remap_from_super_resolution)
 from .sources import FrameSource, sha256_file
+from .rediscovery import Gallery, RediscoveryConfig, split_detections
 from .tracking import TargetTracker, needs_enhancement
 
 
@@ -45,6 +46,9 @@ SR_ACTIONS = tuple(Action("sr", padding, scale) for padding in PADDINGS for scal
 # x1: re-detect on the crop alone; YOLO's own letterbox resize is the only enlargement.
 CROP_ACTIONS = tuple(Action("crop", padding, 1) for padding in PADDINGS)
 METHODS = ("baseline", "fixed", "bicubic", "rule", "learned")
+# "<method>+rd": the same method plus appearance re-discovery when the target is lost
+REDISCOVERY_SUFFIX = "+rd"
+ALL_METHODS = METHODS + tuple(method + REDISCOVERY_SUFFIX for method in METHODS)
 PREDICTION_FIELDS = ["session_id", "method", "frame_id", "timestamp_s", "track_id", "label",
                      "confidence", "x", "y", "width", "height", "observed", "inference_ms", "action_id"]
 
@@ -103,22 +107,28 @@ class InferenceBackend:
             self.torch.cuda.synchronize()
 
     def detect(self, image: np.ndarray, config: ExperimentConfig, *, local: bool = False) -> list[Detection]:
-        result = self.model.predict(image, conf=config.confidence,
-                                    imgsz=config.local_imgsz if local else config.imgsz,
-                                    rect=False, device=self.device, verbose=False)[0]
+        return self._predict(image, config.confidence, config.local_imgsz if local else config.imgsz, config.label)
+
+    def detect_all(self, image: np.ndarray, config: ExperimentConfig, confidence: float) -> list[Detection]:
+        """Full-frame boxes of every class down to ``confidence``; one inference, as detect()."""
+        return self._predict(image, confidence, config.imgsz, None)
+
+    def _predict(self, image: np.ndarray, confidence: float, imgsz: int, label: str | None) -> list[Detection]:
+        result = self.model.predict(image, conf=confidence, imgsz=imgsz, rect=False, device=self.device,
+                                    verbose=False)[0]
         detections = []
         if result.boxes is None:
             return detections
         for xyxy, confidence, cls in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.conf.cpu().numpy(),
                                          result.boxes.cls.cpu().numpy()):
-            label = str(result.names[int(cls)])
-            if label.casefold() != config.label.casefold():
+            label_name = str(result.names[int(cls)])
+            if label is not None and label_name.casefold() != label.casefold():
                 continue
             x1, y1, x2, y2 = map(float, xyxy)
             x1, y1 = max(0, round(x1)), max(0, round(y1))
             x2, y2 = min(image.shape[1], round(x2)), min(image.shape[0], round(y2))
             if x2 > x1 and y2 > y1:
-                detections.append(Detection(label, float(confidence), x1, y1, x2-x1, y2-y1))
+                detections.append(Detection(label_name, float(confidence), x1, y1, x2-x1, y2-y1))
         return detections
 
     def enhance(self, crop: np.ndarray, action: Action) -> np.ndarray:
@@ -195,15 +205,20 @@ def execute_action(backend: Any, frame: np.ndarray, target: Detection | None,
 
 
 class MethodEngine:
-    def __init__(self, method: str, config: ExperimentConfig, selector: Any = None) -> None:
-        if method not in METHODS:
+    def __init__(self, method: str, config: ExperimentConfig, selector: Any = None,
+                 rediscovery: RediscoveryConfig | None = None) -> None:
+        if method not in ALL_METHODS:
             raise ValueError(f"Unknown method: {method}")
-        if method == "learned" and selector is None:
+        self.kind = method.removesuffix(REDISCOVERY_SUFFIX)
+        if self.kind == "learned" and selector is None:
             raise ValueError("learned requires a trained selector")
         self.method, self.config, self.selector = method, config, selector
         self.tracker = TargetTracker(config.retention_s)
+        self.rediscovery = (rediscovery or RediscoveryConfig()) if method.endswith(REDISCOVERY_SUFFIX) else None
+        self.gallery = Gallery(self.rediscovery) if self.rediscovery else None
 
-    def process(self, backend: Any, frame: np.ndarray, base: list[Detection], timestamp_s: float) -> tuple:
+    def process(self, backend: Any, frame: np.ndarray, base: list[Detection], timestamp_s: float,
+                hypotheses: list[Detection] | tuple = ()) -> tuple:
         started = time.perf_counter()
         current = self.tracker.match(base, timestamp_s)
         target = current or self.tracker.predict(timestamp_s)
@@ -214,16 +229,16 @@ class MethodEngine:
                                                     trigger_confidence=self.config.trigger_confidence,
                                                     trigger_area_pct=self.config.trigger_area_pct))
         actions = [NONE]
-        if trigger and self.method in {"fixed", "bicubic"}:
+        if trigger and self.kind in {"fixed", "bicubic"}:
             fixed = Action("sr", self.config.fixed_padding, self.config.fixed_scale)
             if fixed in feasible:
-                actions = [replace(fixed, kind="bicubic") if self.method == "bicubic" else fixed]
-        elif trigger and self.method == "rule":
+                actions = [replace(fixed, kind="bicubic") if self.kind == "bicubic" else fixed]
+        elif trigger and self.kind == "rule":
             region = expanded_crop_region(target, frame.shape[1], frame.shape[0], padding_ratio=0.2)
             scales = dynamic_super_resolution_scales(target, region, target_min_px=self.config.target_min_px,
                                                      max_input_side=self.config.local_imgsz)
             actions = [Action("sr", 0.2, scale) for scale in scales if Action("sr", 0.2, scale) in feasible] or [NONE]
-        elif trigger and self.method == "learned":
+        elif trigger and self.kind == "learned":
             choice = self.selector.choose(features, [a.action_id for a in feasible])
             actions = [next(a for a in feasible if a.action_id == choice)]
         attempts = []
@@ -234,10 +249,29 @@ class MethodEngine:
             if attempt["adopted"]:
                 final = Detection(**attempt["detection"])
                 break
+        if self.gallery is not None:
+            if final is None and target is None:
+                attempts.append(self._rediscover(frame, hypotheses))
+                if attempts[-1]["adopted"]:
+                    final = Detection(**attempts[-1]["detection"])
+            elif final is not None:
+                self.gallery.add(frame, final)  # only boxes the method confirmed itself
         self.tracker.update(final, timestamp_s)
         backend.synchronize()
         overhead_ms = (time.perf_counter() - started) * 1000
         return final, features, attempts, overhead_ms
+
+
+    def _rediscover(self, frame: np.ndarray, hypotheses) -> dict:
+        started = time.perf_counter()
+        found, score = self.gallery.best(frame, list(hypotheses))
+        adopted = found is not None and score >= self.rediscovery.threshold
+        detection = (Detection(self.config.label, found.confidence, found.x, found.y, found.width, found.height)
+                     if adopted else None)
+        return {"action_id": "rediscover", "kind": "rediscover", "padding": 0.0, "scale": 1,
+                "elapsed_ms": (time.perf_counter() - started) * 1000, "detection": detection_dict(detection),
+                "local_detection": None, "adopted": adopted, "roi": None, "score": score,
+                "hypotheses": len(hypotheses), "source_label": found.label if found else None}
 
 
 def provenance(backend: Any, source: FrameSource, config: ExperimentConfig) -> dict:
@@ -272,18 +306,22 @@ def provenance(backend: Any, source: FrameSource, config: ExperimentConfig) -> d
 def run_experiment(source: FrameSource, output: Path, backend: Any, config: ExperimentConfig,
                    *, methods: tuple[str, ...] = ("baseline", "fixed", "bicubic", "rule"),
                    selector: Any = None, max_frames: int | None = None,
-                   collect_candidates: bool = False, allow_training_session: bool = False) -> dict:
+                   collect_candidates: bool = False, allow_training_session: bool = False,
+                   rediscovery: RediscoveryConfig | None = None) -> dict:
     if max_frames is not None and max_frames <= 0:
         raise ValueError("max_frames must be positive")
     if not methods or len(set(methods)) != len(methods):
         raise ValueError("Specify distinct methods")
-    engines = [MethodEngine(method, config, selector) for method in methods]
+    rediscovery = rediscovery or RediscoveryConfig()
+    engines = [MethodEngine(method, config, selector, rediscovery) for method in methods]
+    any_rediscovery = any(engine.rediscovery for engine in engines)
     if selector is not None and source.session_id in set(getattr(selector, "training_session_ids", [])) and not allow_training_session:
         raise ValueError("This session was used to train the selector; reserve it for training, not evaluation")
     if selector is not None and selector.payload.get("experiment_config") not in (None, asdict(config)):
         raise ValueError("Selector training configuration differs from this experiment")
     output.mkdir(parents=True, exist_ok=False)
     manifest = provenance(backend, source, config)
+    manifest.update(rediscovery=asdict(rediscovery) if any_rediscovery else None)
     manifest.update(methods=list(methods), collect_candidates=collect_candidates,
                     training_session_override=allow_training_session, max_frames=max_frames)
     if selector is not None:
@@ -308,11 +346,18 @@ def run_experiment(source: FrameSource, output: Path, backend: Any, config: Expe
                     backend.warmup(frame, config, local=collect_candidates or any(m != "baseline" for m in methods))
                 backend.synchronize()
                 started = time.perf_counter()
-                base = backend.detect(frame, config)
+                if any_rediscovery:
+                    # one inference at a lower threshold; the normal detections are its subset
+                    lowest = min(config.confidence, rediscovery.target_confidence, rediscovery.other_confidence)
+                    base, hypotheses = split_detections(backend.detect_all(frame, config, lowest),
+                                                        config.label, config.confidence, rediscovery)
+                else:
+                    base, hypotheses = backend.detect(frame, config), []
                 backend.synchronize()
                 base_ms = (time.perf_counter() - started) * 1000
                 for engine in engines:
-                    final, features, attempts, overhead_ms = engine.process(backend, frame, base, timestamp_s)
+                    final, features, attempts, overhead_ms = engine.process(backend, frame, base, timestamp_s,
+                                                                            hypotheses)
                     elapsed_ms = base_ms + overhead_ms
                     row = {"session_id": source.session_id, "method": engine.method,
                            "frame_id": input_frame.frame_id, "timestamp_s": timestamp_s,

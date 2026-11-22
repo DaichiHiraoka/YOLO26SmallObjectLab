@@ -108,7 +108,7 @@ DASHBOARD_HTML = f"""<!doctype html>
   </div>
   <div class="grid">
     <section class="panel">
-      <img id="stream" class="video" src="/api/stream" alt="推論映像">
+      <img id="stream" class="video" alt="推論映像">
       <div class="metrics">
         <div class="metric"><span>入力解像度</span><strong id="resolution">—</strong></div>
         <div class="metric"><span>推論</span><strong id="speed">—</strong></div>
@@ -145,7 +145,7 @@ DASHBOARD_HTML = f"""<!doctype html>
           <div><label>確定までの連続フレーム</label><input id="stable" type="number" min="1" max="30" value="3"></div>
         </div>
         <label>対象クラス（英語、カンマ区切り。空欄は全クラス）</label>
-        <input id="classes" placeholder="cell phone, bottle, cup">
+        <input id="classes" value="cup" placeholder="cell phone, bottle, cup">
         <label class="check"><input id="srEnabled" type="checkbox" checked>
           不安定兆候時に最大bboxを局所超解像</label>
         <div class="row">
@@ -260,6 +260,9 @@ async function recordMeasurement() {{
     document.querySelector("#error").textContent = "測定値を記録しました";
   }} catch(e) {{ document.querySelector("#error").textContent = e; }}
 }}
+// On the PC itself show every frame; from the phone (Tailscale) cap it to save mobile data.
+const onThisPc = ["127.0.0.1", "localhost", "[::1]"].includes(location.hostname);
+document.querySelector("#stream").src = onThisPc ? "/api/stream" : "/api/stream?fps=10";
 setInterval(poll, 500); poll();
 </script></body></html>"""
 
@@ -276,6 +279,8 @@ main { width: min(560px, 100%); padding: 16px; }
 .state { font-size: 1.6rem; font-weight: 800; margin: 4px 0; }
 .state.live { color: var(--danger); }
 .big { font-size: 1.35rem; padding: 22px 12px; margin-top: 12px; }
+#result { display: block; width: 100%; margin-top: 12px; border-radius: 8px; background: #000; }
+#result[hidden] { display: none; }
 </style></head>
 <body><main>
   <div class="eyebrow">YOLO26 SMALL OBJECT LAB</div>
@@ -287,6 +292,11 @@ main { width: min(560px, 100%); padding: 16px; }
     <button id="recStart" class="primary big" onclick="recordingAction('/api/recording/start')" disabled>記録開始</button>
     <button id="recStop" class="big" onclick="recordingAction('/api/recording/stop')" disabled>記録終了</button>
     <div id="error" class="error small"></div>
+  </section>
+  <section class="panel" style="margin-top:14px">
+    <button id="resultToggle" onclick="toggleResult()">検出結果を表示</button>
+    <p class="small">PCが枠を描いた映像です（最大10fps）。モバイル回線では通信量に注意してください。</p>
+    <img id="result" alt="PCの検出結果" hidden>
   </section>
 </main>
 <script>"""
@@ -306,6 +316,14 @@ async function poll() {
     document.querySelector("#recStart").disabled = recording.busy || s.recording.active;
     document.querySelector("#recStop").disabled = recording.busy || !s.recording.active;
   } catch (e) { showError("状態取得失敗: " + e); }
+}
+function toggleResult() {
+  const image = document.querySelector("#result");
+  const show = image.hidden;
+  // Clearing src closes the stream, so no data flows while it is hidden.
+  image.src = show ? "/api/stream?fps=10" : "";
+  image.hidden = !show;
+  document.querySelector("#resultToggle").textContent = show ? "検出結果を隠す" : "検出結果を表示";
 }
 setInterval(poll, 1000); poll();
 </script></body></html>"""

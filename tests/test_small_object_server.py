@@ -125,3 +125,54 @@ def test_recording_is_controlled_from_dashboard_and_phone_page(tmp_path):
         server.server_close()
         thread.join(timeout=3)
         lab.stop()
+
+
+def test_phone_can_watch_the_annotated_stream_at_a_lower_frame_rate(tmp_path):
+    from small_object_lab.server import stream_fps
+
+    assert stream_fps(None) is None and stream_fps("10") == 10.0
+    for bad in ("0", "31", "x"):
+        with pytest.raises(ValueError):
+            stream_fps(bad)
+
+    lab = SmallObjectLab(output_root=tmp_path)
+    lab.latest_jpeg = b"\xff\xd8annotated\xff\xd9"
+    server = LabHTTPServer(("127.0.0.1", 0), lab)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        status, phone = request(base_url, "/remote")
+        assert "検出結果を表示" in phone.decode() and "/api/stream?fps=10" in phone.decode()
+        with urllib.request.urlopen(base_url + "/api/stream?fps=10", timeout=15) as stream:
+            assert stream.headers["Content-Type"].startswith("multipart/x-mixed-replace")
+            part = stream.read(72)  # exactly one part; the frame never changes
+        assert b"Content-Length: 13\r\n\r\n\xff\xd8annotated\xff\xd9" in part
+        with pytest.raises(urllib.error.HTTPError) as error:
+            request(base_url, "/api/stream?fps=0")
+        assert error.value.code == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+        lab.stop()
+
+
+def test_dashboard_defaults_to_cup_and_works_from_the_phone(tmp_path):
+    lab = SmallObjectLab(output_root=tmp_path)
+    assert lab.settings.target_classes == "cup" and lab.settings.class_filter() == {"cup"}
+    server = LabHTTPServer(("127.0.0.1", 0), lab)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, dashboard = request(f"http://127.0.0.1:{server.server_port}", "/")
+        page = dashboard.decode()
+        # full rate on the PC, 10 fps when the same page is opened over Tailscale
+        assert 'value="cup"' in page and '"/api/stream?fps=10"' in page
+        status, response = request(f"http://127.0.0.1:{server.server_port}", "/api/status")
+        assert json.loads(response)["settings"]["target_classes"] == "cup"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+        lab.stop()

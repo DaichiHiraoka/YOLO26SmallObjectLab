@@ -5,7 +5,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .runner import PADDINGS
+from .runner import ALL_METHODS, PADDINGS
 from .sources import FrameSource, create_annotation_template
 
 
@@ -16,7 +16,8 @@ def parser() -> argparse.ArgumentParser:
     replay.add_argument("source", type=Path)
     replay.add_argument("--output", type=Path, required=True, help="New output directory (never overwritten)")
     replay.add_argument("--methods", nargs="+", default=["baseline", "fixed", "bicubic", "rule"],
-                        choices=["baseline", "fixed", "bicubic", "rule", "learned"])
+                        choices=list(ALL_METHODS),
+                        help="'<method>+rd' adds appearance re-discovery of a lost target")
     root = Path(__file__).resolve().parents[2]
     replay.add_argument("--model", type=Path, default=root / "yolo26n.pt")
     replay.add_argument("--sr-model", type=Path, default=root / "models" / "FSRCNN_x2.pb")
@@ -28,6 +29,8 @@ def parser() -> argparse.ArgumentParser:
     replay.add_argument("--fixed-scale", type=int, choices=[2, 4, 8], default=4)
     replay.add_argument("--fixed-padding", type=float, choices=list(PADDINGS), default=0.2)
     replay.add_argument("--retention-s", type=float, default=0.75)
+    replay.add_argument("--rediscover-threshold", type=float, default=0.75,
+                        help="Appearance similarity needed to re-adopt a lost target (+rd methods)")
     replay.add_argument("--max-frames", type=int)
     replay.add_argument("--collect-candidates", action="store_true", help="Measure all feasible crop/scale candidates for later supervised training")
     replay.add_argument("--selector", type=Path)
@@ -88,14 +91,16 @@ def main(argv: list[str] | None = None) -> int:
             config = ExperimentConfig(label=args.label, confidence=args.confidence, imgsz=args.imgsz,
                                       local_imgsz=args.local_imgsz, retention_s=args.retention_s,
                                       fixed_scale=args.fixed_scale, fixed_padding=args.fixed_padding)
-            if "learned" in args.methods and args.selector is None:
+            from .rediscovery import RediscoveryConfig
+            if any(m.startswith("learned") for m in args.methods) and args.selector is None:
                 command.error("--methods learned requires --selector")
             selector = LearnedSelector.load(args.selector) if args.selector else None
             backend = InferenceBackend(args.model, args.sr_model, args.device)
             result = run_experiment(source, args.output, backend, config, methods=tuple(args.methods),
                                     selector=selector, max_frames=args.max_frames,
                                     collect_candidates=args.collect_candidates,
-                                    allow_training_session=args.allow_training_session)
+                                    allow_training_session=args.allow_training_session,
+                                    rediscovery=RediscoveryConfig(threshold=args.rediscover_threshold))
             print(json.dumps({"output": str(args.output.resolve()), "status": result["status"],
                               "processed_frames": result["processed_frames"], "summary": result["summary"]},
                              ensure_ascii=False, indent=2))
