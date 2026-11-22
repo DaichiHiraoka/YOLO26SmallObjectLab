@@ -211,7 +211,7 @@ async function poll() {{
       : "スマホから操作: 無効（PCのTailscale IPで待ち受けていません）";
     const sr = s.super_resolution;
     document.querySelector("#srState").textContent = sr.active
-      ? `FSRCNN x${{sr.scale}}実行 (${{sr.reason}}) / 試行 ${{sr.scales_tried.join("→")}} / ${{sr.inference_ms}} ms / 採用 ${{sr.adoptions}}/${{sr.attempts}}`
+      ? `${{sr.model}} x${{sr.scale}}実行 (${{sr.reason}}) / 試行 ${{sr.scales_tried.join("→")}} / ${{sr.inference_ms}} ms / 採用 ${{sr.adoptions}}/${{sr.attempts}}`
       : `局所超解像待機 / x2〜x${{s.settings.sr_max_scale}} / 対象: 最大bbox / 採用 ${{sr.adoptions}}/${{sr.attempts}}`;
     document.querySelector("#error").textContent = s.error || sr.error || "";
     document.querySelector("#detections").innerHTML = s.detections.length ? s.detections.map(d =>

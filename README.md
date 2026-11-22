@@ -69,7 +69,7 @@ uv sync
 
 - PCにTailscaleを入れ、Androidと**同じアカウント**でログインする。起動時に `tailscale status --json` でAndroidを探すので、`tailscale` コマンドが使える状態にする（通常のインストールで使えます）。
 - 初回起動時にWindowsのファイアウォール確認が出たら、プライベートネットワークで許可する。拒否すると映像は届きますが、アプリの「Start recording」が効きません（PCの結果画面の「記録開始」は使えます）。
-- 超解像モデル（FSRCNN）と `yolo26n.pt` は初回実行時に自動で取得します。正解の下書き作成（`propose`）で使う `yolo26x.pt` と `yolo26l.pt` も初回に自動でダウンロードします（合わせて数百MB）。
+- 超解像モデル（既定はESPCN）と `yolo26n.pt` は初回実行時に自動で取得します。正解の下書き作成（`propose`）で使う `yolo26x.pt` と `yolo26l.pt` も初回に自動でダウンロードします（合わせて数百MB）。
 
 ### 注意
 
@@ -127,14 +127,14 @@ outputs/yolo26_small_object_lab/<開始日時>/
 
 ## 不安定時の局所超解像
 
-通常は720×720の全フレームをそのままYOLO26へ渡します。次の兆候が出た場合だけ、検出中でbbox面積が最大の物体を選び、bboxの各辺へ20%の余白を加えた局所領域をFSRCNNで超解像して再推論します。切り出しは原則としてbboxの約1.4倍に留まり、bbox自体が画面の大部分を占めない限り全画面にはなりません。
+通常は720×720の全フレームをそのままYOLO26へ渡します。次の兆候が出た場合だけ、検出中でbbox面積が最大の物体を選び、bboxの各辺へ20%の余白を加えた局所領域を超解像（既定はESPCN）して再推論します。切り出しは原則としてbboxの約1.4倍に留まり、bbox自体が画面の大部分を占めない限り全画面にはなりません。
 
 - confidenceが既定`0.45`以下
 - bbox面積が画面の既定`1.0%`以下
 - 前フレームからconfidenceまたはbbox面積が急低下
 - 検出が消えてから2フレーム以内
 
-倍率は対象bboxの短辺を既定96px以上にすることを目標に、`x2`、`x4`、`x8`から動的に選びます。最初の倍率で対象を再検出できない、または通常検出のconfidenceを上回らない場合は、局所画像がYOLO入力上限を大きく超えない範囲で次の倍率へ段階的に上げます。`x4`と`x8`はFSRCNN x2モデルをそれぞれ2回、3回適用するカスケード方式です。
+倍率は対象bboxの短辺を既定96px以上にすることを目標に、`x2`、`x4`、`x8`から動的に選びます。最初の倍率で対象を再検出できない、または通常検出のconfidenceを上回らない場合は、局所画像がYOLO入力上限を大きく超えない範囲で次の倍率へ段階的に上げます。ESPCNは`x2`・`x4`の学習済みモデルを使い、`x8`は`x4`と`x2`の組み合わせです（`--sr-model fsrcnn` では、従来どおりFSRCNN x2モデルを2回・3回適用します）。
 
 青枠は超解像した領域、マゼンタのbboxと`SR x2`〜`SR x8`表示は局所再推論結果が通常結果より有効で採用されたことを示します。画面から超解像の有効・無効、開始しきい値、目標短辺、最大倍率を変更できます。`detections.csv`と`measurements.csv`には検出元と採用倍率を記録します。
 
@@ -146,7 +146,7 @@ outputs/yolo26_small_object_lab/<開始日時>/
 
 対象選択は[small_object_lab/super_resolution.py](./small_object_lab/super_resolution.py)の`select_super_resolution_target()`へ分離してあります。現在は最大bboxですが、後から別の選択方法へ差し替えられます。
 
-FSRCNN x2モデル（約40KB）は初回使用時に自動取得し、`models/FSRCNN_x2.pb`へキャッシュします。取得後はSHA-256を検証します。モデルはOpenCVのGSoC成果として公開されている[Saafke/FSRCNN_Tensorflow](https://github.com/Saafke/FSRCNN_Tensorflow)（Apache-2.0）を使用します。
+超解像モデルは初回使用時に自動取得し、`models/`へキャッシュします。取得後はSHA-256を検証します。既定のESPCN（x2/x4、各約90〜100KB）は[fannymonori/TF-ESPCN](https://github.com/fannymonori/TF-ESPCN)、比較用のFSRCNNは[Saafke/FSRCNN_Tensorflow](https://github.com/Saafke/FSRCNN_Tensorflow)の公開モデルです。ESPCNを既定にした理由は[超解像モデルの比較](docs/SR_MODEL_COMPARISON_202611.md)にまとめています。起動時の `--sr-model`（`espcn`・`fsrcnn`・`lapsrn`・`edsr`）で切り替えられます。
 
 ## 比較設定
 
@@ -156,7 +156,7 @@ FSRCNN x2モデル（約40KB）は初回使用時に自動取得し、`models/FS
 - `imgsz`: `960`
 - confidence: `0.20`
 - 安定検出: `3`フレーム
-- 局所超解像: `FSRCNN x2 / x4 / x8`
+- 局所超解像: `ESPCN x2 / x4 / x8`（`--sr-model` で変更可）
 - 超解像後の目標短辺: `96px`
 - 最大倍率: `x8`
 

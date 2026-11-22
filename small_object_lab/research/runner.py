@@ -20,8 +20,9 @@ import cv2
 import numpy as np
 
 from ..metrics import Detection, intersection_over_union, plausible_replacement
-from ..super_resolution import (FSRCNNSuperResolution, dynamic_super_resolution_scales,
-                                expanded_crop_region, remap_from_super_resolution)
+from ..super_resolution import (DEFAULT_SR_MODEL, SR_MODEL_NAMES, create_super_resolution,
+                                dynamic_super_resolution_scales, expanded_crop_region,
+                                remap_from_super_resolution)
 from .sources import FrameSource, sha256_file
 from .rediscovery import Gallery, RediscoveryConfig, split_detections
 from .tracking import TargetTracker, needs_enhancement
@@ -65,6 +66,8 @@ class ExperimentConfig:
     fixed_scale: int = 4
     fixed_padding: float = 0.20
     target_min_px: int = 96
+    # Engine behind every "sr" action; recorded so selectors and runs stay comparable.
+    sr_model: str = DEFAULT_SR_MODEL
 
     def __post_init__(self) -> None:
         if not self.label.strip():
@@ -81,6 +84,8 @@ class ExperimentConfig:
             raise ValueError("trigger_area_pct must be between 0 and 100")
         if self.target_min_px <= 0:
             raise ValueError("target_min_px must be positive")
+        if self.sr_model not in SR_MODEL_NAMES:
+            raise ValueError(f"sr_model must be one of {SR_MODEL_NAMES}")
 
 
 def detection_dict(detection: Detection | None) -> dict | None:
@@ -90,17 +95,18 @@ def detection_dict(detection: Detection | None) -> dict | None:
 
 
 class InferenceBackend:
-    def __init__(self, model_path: Path, sr_path: Path, device: str = "auto") -> None:
+    def __init__(self, model_path: Path, sr_model: str = DEFAULT_SR_MODEL, device: str = "auto",
+                 model_dir: Path | None = None) -> None:
         # Local weights only: a misspelled path must not download a different model.
         self.model_path = model_path.resolve(strict=True)
-        self.sr_path = sr_path.resolve(strict=True)
+        self.sr_model = sr_model
+        self.sr = create_super_resolution(sr_model, model_dir or Path(__file__).resolve().parents[2] / "models")
         import torch
         from ultralytics import YOLO
 
         self.torch = torch
         self.device = ("0" if torch.cuda.is_available() else "cpu") if device == "auto" else device
         self.model = YOLO(str(self.model_path))
-        self.sr = FSRCNNSuperResolution(model_path=self.sr_path)
 
     def synchronize(self) -> None:
         if self.device != "cpu" and self.torch.cuda.is_available():
@@ -296,7 +302,8 @@ def provenance(backend: Any, source: FrameSource, config: ExperimentConfig) -> d
             "source_metadata": source.metadata, "config": asdict(config), "git_head": git,
             "code_sha256": code_hashes, "packages": versions,
             "model_sha256": sha256_file(backend.model_path) if hasattr(backend, "model_path") else None,
-            "sr_sha256": sha256_file(backend.sr_path) if hasattr(backend, "sr_path") else None,
+            "sr_model": getattr(backend, "sr_model", None),
+            "sr_sha256": backend.sr.model_sha256() if hasattr(backend, "sr") else None,
             "device": getattr(backend, "device", "test"), "status": "running",
             "tracker": "single_target_iou_velocity_v1",
             "timing": "shared measured base inference + per-method processing; excludes decode, disk I/O and network",
@@ -317,7 +324,11 @@ def run_experiment(source: FrameSource, output: Path, backend: Any, config: Expe
     any_rediscovery = any(engine.rediscovery for engine in engines)
     if selector is not None and source.session_id in set(getattr(selector, "training_session_ids", [])) and not allow_training_session:
         raise ValueError("This session was used to train the selector; reserve it for training, not evaluation")
-    if selector is not None and selector.payload.get("experiment_config") not in (None, asdict(config)):
+    if getattr(backend, "sr_model", config.sr_model) != config.sr_model:
+        raise ValueError("The backend's super-resolution model differs from config.sr_model")
+    trained = selector.payload.get("experiment_config") if selector is not None else None
+    # Configurations saved before sr_model was recorded were measured with FSRCNN.
+    if trained is not None and {"sr_model": "fsrcnn", **trained} != asdict(config):
         raise ValueError("Selector training configuration differs from this experiment")
     output.mkdir(parents=True, exist_ok=False)
     manifest = provenance(backend, source, config)

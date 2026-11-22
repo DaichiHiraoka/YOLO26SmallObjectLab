@@ -208,6 +208,7 @@ class LargestObjectInstabilityMonitor:
 
 
 class FSRCNNSuperResolution:
+    name = "fsrcnn"
     scale = 2
     max_scale = 8
 
@@ -227,6 +228,9 @@ class FSRCNNSuperResolution:
     @property
     def ready(self) -> bool:
         return self._upsampler is not None
+
+    def model_sha256(self) -> dict[int, str]:
+        return {self.scale: self.expected_sha256}
 
     def enhance(self, image: np.ndarray, *, scale: int = 2) -> np.ndarray:
         if image.size == 0:
@@ -364,6 +368,13 @@ class OpenCVSuperResolution:
         self.model_dir = model_dir
         self._upsamplers: dict[int, Any] = {}
 
+    @property
+    def ready(self) -> bool:
+        return bool(self._upsamplers)
+
+    def model_sha256(self) -> dict[int, str]:
+        return dict(self.spec.sha256)
+
     def enhance(self, image: np.ndarray, *, scale: int = 2) -> np.ndarray:
         if image.size == 0:
             raise ValueError("超解像へ渡す画像が空です")
@@ -413,3 +424,20 @@ class OpenCVSuperResolution:
                 f"{name}のSHA-256が一致しません。"
                 f" expected={self.spec.sha256[scale]} actual={digest}"
             )
+
+
+# ESPCN is the default: on human-annotated cup recordings it re-detected 2.5-4x
+# more small cups than bicubic in 0.6-1.8 ms per crop, close to the best
+# heavier models (docs/SR_MODEL_COMPARISON_202611.md). FSRCNN stays available
+# to reproduce earlier runs.
+DEFAULT_SR_MODEL = "espcn"
+SR_MODEL_NAMES = ("espcn", "fsrcnn", "lapsrn", "edsr")
+
+
+def create_super_resolution(name: str = DEFAULT_SR_MODEL, model_dir: Path = Path("models")) -> Any:
+    """Return an engine with ``enhance(image, scale=)``, ``ready``, ``name``."""
+    if name == "fsrcnn":
+        return FSRCNNSuperResolution(model_dir / "FSRCNN_x2.pb")
+    if name not in SR_MODEL_SPECS:
+        raise ValueError(f"超解像モデルは{SR_MODEL_NAMES}から指定してください")
+    return OpenCVSuperResolution(name, model_dir)

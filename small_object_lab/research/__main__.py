@@ -5,6 +5,7 @@ import argparse
 import json
 from pathlib import Path
 
+from ..super_resolution import DEFAULT_SR_MODEL, SR_MODEL_NAMES
 from .runner import ALL_METHODS, PADDINGS
 from .sources import FrameSource, create_annotation_template
 
@@ -20,7 +21,8 @@ def parser() -> argparse.ArgumentParser:
                         help="'<method>+rd' adds appearance re-discovery of a lost target")
     root = Path(__file__).resolve().parents[2]
     replay.add_argument("--model", type=Path, default=root / "yolo26n.pt")
-    replay.add_argument("--sr-model", type=Path, default=root / "models" / "FSRCNN_x2.pb")
+    replay.add_argument("--sr-model", default=DEFAULT_SR_MODEL, choices=list(SR_MODEL_NAMES),
+                        help="Super-resolution engine for 'sr' actions (fsrcnn reproduces runs before Nov 2026)")
     replay.add_argument("--device", default="auto")
     replay.add_argument("--label", default="cup")
     replay.add_argument("--confidence", type=float, default=0.20)
@@ -90,7 +92,8 @@ def main(argv: list[str] | None = None) -> int:
             source = FrameSource(args.source, allow_incomplete=args.allow_incomplete)
             config = ExperimentConfig(label=args.label, confidence=args.confidence, imgsz=args.imgsz,
                                       local_imgsz=args.local_imgsz, retention_s=args.retention_s,
-                                      fixed_scale=args.fixed_scale, fixed_padding=args.fixed_padding)
+                                      fixed_scale=args.fixed_scale, fixed_padding=args.fixed_padding,
+                                      sr_model=args.sr_model)
             from .rediscovery import RediscoveryConfig
             if any(m.startswith("learned") for m in args.methods) and args.selector is None:
                 command.error("--methods learned requires --selector")

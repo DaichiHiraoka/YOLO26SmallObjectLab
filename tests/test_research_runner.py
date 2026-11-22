@@ -185,3 +185,30 @@ def test_live_merge_rejects_a_part_of_the_target():
     whole = Detection("key", 0.90, 101, 100, 69, 54, enhanced=True, enhancement_scale=4)
     merged, used = SmallObjectLab._merge_super_resolution_detection([bunch], bunch, whole)
     assert used and merged == [whole]
+
+
+def test_espcn_is_default_and_fsrcnn_era_selector_needs_fsrcnn(tmp_path):
+    from dataclasses import asdict
+
+    from small_object_lab.super_resolution import create_super_resolution
+
+    assert ExperimentConfig().sr_model == "espcn"
+    assert create_super_resolution().name == "espcn"
+    assert create_super_resolution("fsrcnn").name == "fsrcnn"
+    with pytest.raises(ValueError, match="sr_model"):
+        ExperimentConfig(sr_model="nearest")
+
+    # Selectors trained before sr_model was recorded learned FSRCNN outcomes.
+    legacy = {k: v for k, v in asdict(ExperimentConfig()).items() if k != "sr_model"}
+
+    class LegacySelector:
+        payload = {"experiment_config": legacy}
+        training_session_ids = []
+
+    source = recording(tmp_path)
+    with pytest.raises(ValueError, match="configuration differs"):
+        run_experiment(source, tmp_path / "espcn", FakeBackend(), ExperimentConfig(),
+                       methods=("baseline",), selector=LegacySelector())
+    result = run_experiment(source, tmp_path / "fsrcnn", FakeBackend(), ExperimentConfig(sr_model="fsrcnn"),
+                            methods=("baseline",), selector=LegacySelector())
+    assert result["status"] == "complete" and result["config"]["sr_model"] == "fsrcnn"

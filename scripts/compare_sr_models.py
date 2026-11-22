@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import csv
 import json
 import sys
 import time
@@ -36,6 +37,34 @@ from probe_enlargement import samples  # noqa: E402
 from small_object_lab.metrics import Detection, intersection_over_union  # noqa: E402
 from small_object_lab.super_resolution import (  # noqa: E402
     SR_MODEL_SPECS, FSRCNNSuperResolution, OpenCVSuperResolution, expanded_crop_region)
+
+
+def annotated_samples(recording: Path, annotations: Path, factors: list[float], limit: int):
+    """Samples from human-reviewed visible boxes instead of baseline detections.
+
+    "real" keeps each frame as recorded; "synthetic_1/N" shrinks it (INTER_AREA,
+    then JPEG quality 75 as in probe_enlargement) with the box scaled alike, so
+    objects the baseline missed are included too.
+    """
+    rows = [r for r in csv.DictReader(annotations.open(encoding="utf-8-sig"))
+            if r["reviewed"] == "1" and r["visible"] == "1"]
+    if len(rows) > limit > 1:  # spread over the whole recording
+        rows = [rows[round(i * (len(rows) - 1) / (limit - 1))] for i in range(limit)]
+    paths = {int(r["frame_id"]): r["path"] for r in csv.DictReader((recording / "frames.csv").open(encoding="utf-8"))}
+    for factor in (1.0, *factors):
+        for row in rows:
+            image = cv2.imdecode(np.fromfile(recording / paths[int(row["frame_id"])], dtype=np.uint8), cv2.IMREAD_COLOR)
+            x, y, width, height = (float(row[k]) for k in ("x", "y", "width", "height"))
+            if factor == 1.0:
+                yield "real", image, Detection("target", 1, round(x), round(y), max(1, round(width)), max(1, round(height)))
+                continue
+            small = cv2.resize(image, None, fx=factor, fy=factor, interpolation=cv2.INTER_AREA)
+            small = cv2.imdecode(cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 75])[1], cv2.IMREAD_COLOR)
+            canvas = np.full_like(image, 128)
+            canvas[:small.shape[0], :small.shape[1]] = small
+            yield (f"synthetic_1/{round(1 / factor)}", canvas,
+                   Detection("target", 1, round(x * factor), round(y * factor),
+                             max(1, round(width * factor)), max(1, round(height * factor))))
 
 
 def enlargers(names: list[str], scales: list[int]) -> dict:
@@ -54,7 +83,10 @@ def enlargers(names: list[str], scales: list[int]) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("recording", type=Path)
-    parser.add_argument("predictions", type=Path, help="predictions.csv whose baseline rows give approximate truth")
+    parser.add_argument("predictions", type=Path, nargs="?",
+                        help="predictions.csv whose baseline rows give approximate truth")
+    parser.add_argument("--annotations", type=Path,
+                        help="Reviewed annotation CSV to use as truth instead of predictions.csv")
     parser.add_argument("--weights", type=Path, nargs="+", required=True)
     parser.add_argument("--models", nargs="+", default=["espcn", "lapsrn"], choices=sorted(SR_MODEL_SPECS),
                         help="edsr is far heavier; add it only as an upper-bound reference")
@@ -86,11 +118,17 @@ def main() -> None:
     confidence = collections.defaultdict(list)
     elapsed_ms = collections.defaultdict(list)
     crop_sides = collections.defaultdict(list)
-    for group, frame, truth in samples(args.recording, args.predictions, args.min_time, args.factors, args.limit):
+    if (args.predictions is None) == (args.annotations is None):
+        parser.error("give either predictions.csv or --annotations")
+    if args.annotations:
+        source = annotated_samples(args.recording, args.annotations, args.factors, args.limit)
+    else:
+        source = samples(args.recording, args.predictions, args.min_time, args.factors, args.limit)
+    for group, frame, truth in source:
         h, w = frame.shape[:2]
         region = expanded_crop_region(truth, w, h, padding_ratio=args.padding)
         crop = frame[region.y:region.y + region.height, region.x:region.x + region.width]
-        local_truth = Detection("key", 1, truth.x - region.x, truth.y - region.y, truth.width, truth.height)
+        local_truth = Detection("target", 1, truth.x - region.x, truth.y - region.y, truth.width, truth.height)
         crop_sides[group].append(max(crop.shape[:2]))
         for variant, (enlarge, scale) in methods.items():
             started = time.perf_counter()
@@ -105,7 +143,7 @@ def main() -> None:
                                                        result.boxes.cls.cpu().numpy()):
                     if args.label and result.names[int(cls)] != args.label:
                         continue
-                    box = Detection("key", float(conf), round(x1 / scale), round(y1 / scale),
+                    box = Detection("target", float(conf), round(x1 / scale), round(y1 / scale),
                                     max(1, round((x2 - x1) / scale)), max(1, round((y2 - y1) / scale)))
                     if intersection_over_union(box, local_truth) >= 0.3:
                         best = max(best, float(conf))

@@ -137,6 +137,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="YOLO weights for the live view, e.g. the key detector "
         "outputs/key_detector/key_o365_leftincar_all_zoom_v1/weights/last.pt",
     )
+    parser.add_argument(
+        "--sr-model",
+        default="espcn",
+        choices=["espcn", "fsrcnn", "lapsrn", "edsr"],
+        help="Super-resolution model for local re-detection (default: espcn)",
+    )
     return parser
 
 
@@ -156,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_server(
             source=source,
             model=args.model,
+            sr_model=args.sr_model,
             open_browser=True,
             remote_host=find_self_tailscale_ipv4(status),
         )

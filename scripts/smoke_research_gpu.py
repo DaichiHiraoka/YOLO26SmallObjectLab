@@ -23,7 +23,7 @@ def main() -> None:
     parser.add_argument("--images", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--sr-model", type=Path, required=True)
+    parser.add_argument("--sr-model", default="espcn", choices=["espcn", "fsrcnn", "lapsrn", "edsr"])
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     files = sorted(args.images.glob("auto_*.jpg"))
@@ -43,7 +43,7 @@ def main() -> None:
     finally:
         recorder.close()
     source = FrameSource(recorder.output_dir)
-    config = ExperimentConfig()
+    config = ExperimentConfig(sr_model=args.sr_model)
     backend = InferenceBackend(args.model, args.sr_model)
     result = run_experiment(source, args.output / "comparison", backend, config, collect_candidates=True)
     # Exercise each enhancement factor even when the detector chooses no recovery action.

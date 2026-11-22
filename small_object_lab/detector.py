@@ -24,7 +24,8 @@ from .super_resolution import (
     CropRegion,
     DEFAULT_SR_MAX_INPUT_SIDE,
     DEFAULT_SR_TARGET_MIN_PX,
-    FSRCNNSuperResolution,
+    DEFAULT_SR_MODEL,
+    create_super_resolution,
     LargestObjectInstabilityMonitor,
     SuperResolutionDecision,
     SUPPORTED_SR_SCALES,
@@ -92,6 +93,7 @@ class SmallObjectLab:
         source: str = "",
         output_root: Path = Path("outputs/yolo26_small_object_lab"),
         auto_save_interval_sec: float = 15.0,
+        sr_model: str = DEFAULT_SR_MODEL,
     ) -> None:
         if auto_save_interval_sec <= 0:
             raise ValueError("auto_save_interval_sec must be greater than 0")
@@ -111,7 +113,7 @@ class SmallObjectLab:
         self.measurements_lock = threading.Lock()
         self.settings = LabSettings()
         self.stability = StabilityTracker()
-        self.super_resolution = FSRCNNSuperResolution()
+        self.super_resolution = create_super_resolution(sr_model)
         self.instability_monitor = LargestObjectInstabilityMonitor()
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
@@ -493,7 +495,7 @@ class SmallObjectLab:
                 "remote_url": self.remote_url,
                 "super_resolution": {
                     "enabled": self.settings.super_resolution_enabled,
-                    "model": "FSRCNN x2 cascade",
+                    "model": self._super_resolution_label(),
                     "target_strategy": "largest_bbox",
                     "ready": self.super_resolution.ready,
                     "active": self.super_resolution_active,
@@ -544,6 +546,9 @@ class SmallObjectLab:
             "count": self.recording_count,
             "last": recorder.status() if recorder is not None else None,
         }
+
+    def _super_resolution_label(self) -> str:
+        return str(getattr(self.super_resolution, "name", "sr")).upper()
 
     def _resolved_device(self) -> str:
         if self.device != "auto":
@@ -697,7 +702,7 @@ class SmallObjectLab:
             )
             cv2.putText(
                 annotated,
-                f"FSRCNN x{sr_scale}: {decision.reason}",
+                f"{self._super_resolution_label()} x{sr_scale}: {decision.reason}",
                 (sr_region.x, max(20, sr_region.y - 7)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,

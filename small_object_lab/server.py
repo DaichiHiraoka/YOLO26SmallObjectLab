@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .detector import SmallObjectLab
+from .super_resolution import DEFAULT_SR_MODEL, SR_MODEL_NAMES
 from .web import DASHBOARD_HTML, REMOTE_HTML
 
 
@@ -200,6 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--model", default="yolo26n.pt")
+    parser.add_argument("--sr-model", default=DEFAULT_SR_MODEL, choices=list(SR_MODEL_NAMES))
     parser.add_argument(
         "--source",
         required=True,
@@ -233,12 +235,14 @@ def run_server(
     output_dir: Path = Path("outputs/yolo26_small_object_lab"),
     open_browser: bool = False,
     remote_host: str | None = None,
+    sr_model: str = DEFAULT_SR_MODEL,
 ) -> int:
     lab = SmallObjectLab(
         model_name=model,
         device=device,
         source=source,
         output_root=output_dir,
+        sr_model=sr_model,
     )
     server = LabHTTPServer((host, port), lab)
     servers = [server]
@@ -299,6 +303,7 @@ def main() -> int:
         output_dir=args.output_dir,
         open_browser=args.open_browser,
         remote_host=args.remote_host,
+        sr_model=args.sr_model,
     )
 
 

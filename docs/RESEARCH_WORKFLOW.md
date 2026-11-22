@@ -134,6 +134,9 @@ CSVだけの雛形が必要なら `annotate` を `annotation-template` に置き
 - 切り出しのみ・bicubic・FSRCNN（現行）・指定したモデルを、同じ切り出し（余白100%）で比べます。既定はESPCNとLapSRN、倍率はx2とx4です。EDSRは非常に重いので、上限の参考にするときだけ `--models espcn lapsrn edsr` で加えます。
 - 表示する時間は拡大処理だけの中央値で、CPU（OpenCV）で計測します。`--threads` でスレッド数を制限できます。
 - 鍵の検出器はbicubicとFSRCNNの拡大画像を混ぜて学習しているので、ほかのモデルは不利です。`--weights` に別の検出器を並べるか、COCOのモデルを `--label` 付きで指定して、順位が検出器1つに依存していないかを確かめてください。
+- 人が確認した正解枠があれば、`predictions.csv` の代わりに `--annotations <注釈CSV>` を指定すると、正解枠から標本を作ります（baselineが見落とした対象も含まれます。縮小は `--factors` で指定）。2026年11月の比較では、COCOの `yolo26n.pt`・`yolo26s.pt` と `--label cup` で、カップの正解枠を使いました。
+
+比較の結果、比較実行とライブ画面の超解像の既定はESPCNにしました（[超解像モデルの比較](SR_MODEL_COMPARISON_202611.md)）。`replay` の `--sr-model fsrcnn` で、2026年11月以前と同じFSRCNNの結果を再現できます。それ以前に学習した選択モデルはFSRCNNの候補で学習しているので、`--sr-model fsrcnn` のときだけ使えます。
 
 ## 現時点で本人の作業を待つ部分
 
